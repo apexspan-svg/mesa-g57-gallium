@@ -47,7 +47,10 @@
 extern "C" {
 #endif
 
-#if DETECT_OS_ANDROID && 0 /* PATCH: Termux userland lacks AOSP libsync; force portable poll() path */
+#if DETECT_OS_ANDROID && !defined(__TERMUX__)
+/* Termux userland lacks AOSP libsync, so Termux builds (which define
+ * __TERMUX__) take the portable poll() path below; NDK builds use the
+ * system's libsync like upstream. */
 /* On Android, rely on the system's libsync instead of rolling our own
  * sync_wait() and sync_merge().  This gives us compatibility with pre-4.7
  * Android kernels.
