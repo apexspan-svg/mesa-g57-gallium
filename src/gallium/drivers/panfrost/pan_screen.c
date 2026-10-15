@@ -1047,6 +1047,8 @@ panfrost_create_screen(int fd, const struct pipe_screen_config *config,
       ralloc_free(screen);
       return NULL;
    }
+   fprintf(stderr, "TMPDBG panfrost_create_screen: open_device ok (arch %d)\n",
+           dev->arch);
 
    if (dev->debug & PAN_DBG_NO_AFBC)
       dev->has_afbc = false;
@@ -1150,9 +1152,11 @@ panfrost_create_screen(int fd, const struct pipe_screen_config *config,
                           4096, "Preload shaders", false, true) ||
        panfrost_pool_init(&screen->mempools.desc, NULL, dev, 0, 65536,
                           "Preload RSDs", false, true)) {
+      fprintf(stderr, "TMPDBG panfrost_create_screen: pool_init FAILED\n");
       panfrost_destroy_screen(&(screen->base));
       return NULL;
    }
+   fprintf(stderr, "TMPDBG panfrost_create_screen: pools ok\n");
 
    for (unsigned i = 0; i <= MESA_SHADER_COMPUTE; i++)
       screen->base.nir_options[i] =
