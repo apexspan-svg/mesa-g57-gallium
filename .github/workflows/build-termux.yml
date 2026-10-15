@@ -1,0 +1,55 @@
+name: termux-native-gallium
+
+# True Termux binaries ($PREFIX, bionic) via the official Termux docker
+# image on an arm64 runner. Replaces the proot attempt (proot cannot run
+# bionic binaries without Android's loader; the docker image ships it).
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 300
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Build inside Termux container
+        run: |
+          docker pull termux/termux-docker:aarch64
+          docker run --rm -v "${{ github.workspace }}:/repo" \
+            termux/termux-docker:aarch64 bash -c '
+            set -ex
+            pkg update -y
+            pkg install -y python clang bison flex pkg-config ninja cmake git \
+              libdrm xorgproto libx11 libxcb libxshmfence \
+              libandroid-shmem-static spirv-tools spirv-llvm-translator \
+              libclc glslang
+            pip install -q meson mako pyyaml packaging setuptools
+            cd /repo
+            meson setup build-termux \
+              -Dbuildtype=release \
+              -Dgallium-drivers=panfrost \
+              -Dvulkan-drivers= \
+              -Dplatforms=x11 \
+              -Dpanfrost-kmds=kbase,panthor \
+              -Dbuild-tests=false \
+              -Dprefix=/data/data/com.termux/files/usr \
+              -Dc_link_args=-landroid-shmem \
+              -Dcpp_link_args=-landroid-shmem
+            ninja -C build-termux
+            DESTDIR=/repo/stage ninja -C build-termux install
+            '
+
+      - name: Package Termux drop-in
+        run: |
+          cd stage/data/data/com.termux/files/usr
+          tar -czf "$GITHUB_WORKSPACE/panfrost-g57-termux.tar.gz" lib/
+
+      - name: Upload Termux package
+        uses: actions/upload-artifact@v4
+        with:
+          name: panfrost-g57-termux
+          path: panfrost-g57-termux.tar.gz
