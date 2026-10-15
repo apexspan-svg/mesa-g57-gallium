@@ -1,0 +1,43 @@
+name: android-gallium-kbase
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, gallium-kbase-jm-v1]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install LLVM 21 repo (one major version for clang/libclc/SPIRV)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -qy wget gnupg
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm21.list
+          sudo apt-get update -q
+
+      - name: Install build deps
+        run: |
+          sudo apt-get install -qy meson ninja-build pkg-config flex bison \
+            python3-mako python3-packaging python3-yaml \
+            llvm-21-dev libclang-21-dev clang-21 libclc-21-dev libllvmspirvlib-21-dev
+
+      - name: Install Android NDK r29
+        run: |
+          cd /tmp
+          wget -q https://dl.google.com/android/repository/android-ndk-r29-linux.zip
+          unzip -q android-ndk-r29-linux.zip
+          echo "ANDROID_NDK_HOME=/tmp/android-ndk-r29" >> "$GITHUB_ENV"
+
+      - name: Cross-build Gallium panfrost (kbase) + EGL/GLES
+        run: ./build-android-ci.sh
+
+      - name: Upload driver zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: panfrost-g57-kbase-android
+          path: dist/panfrost-g57-kbase-android.zip

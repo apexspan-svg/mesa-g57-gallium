@@ -1,0 +1,1800 @@
+/*
+ * PanVK JM backend submit via raw kbase ioctls.
+ *
+ * Quando PANVK_USE_KBASE=1, esta implementacao substitui a submissao
+ * DRM Panfrost por KBASE_IOCTL_JOB_SUBMIT direto em /dev/mali0.
+ */
+
+#include "panvk_device.h"
+#include "panvk_physical_device.h"
+#include "panvk_priv_bo.h"
+#include "panvk_queue.h"
+#include "panvk_cmd_buffer.h"
+#include "decode.h"
+
+#include "lib/kmod/kbase_kmod.h"
+#include "lib/kmod/pan_kmod.h"
+
+#include <assert.h>
+#include <errno.h>
+#include <poll.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <sys/ioctl.h>
+#include <time.h>
+#include <unistd.h>
+#include "util/os_time.h"
+
+/* kbase ioctl definitions */
+#define KBASE_IOCTL_TYPE 0x80
+struct kbase_ioctl_job_submit { uint64_t addr; uint32_t nr_atoms; uint32_t stride; };
+#define KBASE_IOCTL_JOB_SUBMIT _IOW(KBASE_IOCTL_TYPE, 2, struct kbase_ioctl_job_submit)
+
+struct base_jd_event_v2 {
+   uint32_t event_code;
+   uint8_t atom_number;
+   uint8_t padding[3];
+   uint64_t udata[2];
+};
+
+enum {
+   BASE_JD_EVENT_DONE = 0x01,
+};
+
+/* Implemented here; the only caller (the kbase path of gpu_queue_submit in
+ * panvk_vX_gpu_queue.c) prototypes it as panvk_per_arch(kbase_jm_submit). */
+VkResult
+panvk_per_arch(kbase_jm_submit)(struct vk_queue *vk_queue,
+                                struct panvk_gpu_queue *queue,
+                                struct panvk_device *dev,
+                                struct vk_queue_submit *submit);
+
+/* kbase CPU syncs are resolved by the wait_many hook when someone waits on
+ * them.  The JM backend submits jobs synchronously, so by the time the
+ * signal is armed the GPU work is already done. */
+static VkResult
+panvk_jm_kbase_wait_done(UNUSED void *data,
+                         UNUSED const uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT],
+                         UNUSED uint64_t abs_timeout_ns)
+{
+   return VK_SUCCESS;
+}
+
+/* base_jd_atom_v2 as understood by this kernel (empirically determined:
+ * * KBASE_IOCTL_JOB_SUBMIT requires stride == sizeof(base_jd_atom_v2) and
+ *   the only accepted sizes on this kbase are 64 and 72 bytes (the latter
+ *   being sizeof + the v2 header's 8 bytes of "seq_nr"-free padding used by
+ *   some builds).  The atom lives in *user memory*; the kernel copies it with
+ *   copy_from_user and uses .jc as the GPU address of the job chain.
+ * * core_req chooses the job slot (BASE_JD_REQ_T -> tiler,
+ *   BASE_JD_REQ_FS -> fragment, BASE_JD_REQ_CS -> vertex/compute). */
+#define BASE_JD_REQ_FS ((uint32_t)1 << 0)
+#define BASE_JD_REQ_CS ((uint32_t)1 << 1)
+#define BASE_JD_REQ_T ((uint32_t)1 << 2)
+#define BASE_JD_REQ_V ((uint32_t)1 << 4)
+#define BASE_JD_REQ_EXTERNAL_RESOURCES ((uint32_t)1 << 8)
+
+#define BASE_EXT_RES_ACCESS_EXCLUSIVE 1ull
+#define BASE_EXT_RES_COUNT_MAX 10
+
+struct base_external_resource {
+   uint64_t ext_resource;
+};
+#define BASE_JD_PRIO_MEDIUM 0u
+
+struct base_dependency {
+   uint8_t atom_id;
+   uint8_t dependency_type;
+} __attribute__((packed));
+
+struct base_jd_atom_v2 {
+   uint64_t jc;
+   uint64_t udata[2];
+   uint64_t extres_list;
+   uint16_t nr_extres;
+   uint8_t jit_id[2];
+   struct base_dependency pre_dep[2];
+   uint8_t atom_number;
+   uint8_t prio;
+   uint8_t device_nr;
+   uint8_t jobslot;
+   uint32_t core_req;
+   uint8_t payload[16]; /* padding to 64 bytes */
+} __attribute__((packed, aligned(16)));
+
+/* Per-batch state prepared for submission: everything up to (but excluding)
+ * the submit+wait itself, so one job bag can cover many batches. */
+struct panvk_kbase_jm_prepared_batch {
+   struct panvk_cmd_buffer *cmdbuf;
+   struct panvk_batch *batch;
+   uint32_t vtc_core;
+   uint32_t frag_core;
+   struct base_external_resource extres[BASE_EXT_RES_COUNT_MAX];
+   unsigned nr_extres;
+};
+
+static VkResult
+panvk_kbase_wait_jobs(struct panvk_device *dev,
+                     const struct base_jd_atom_v2 *atoms, unsigned count)
+{
+   bool pending[256] = { false };
+   for (unsigned i = 0; i < count; i++)
+      pending[atoms[i].atom_number] = true;
+
+   VkResult result = VK_SUCCESS;
+   const int64_t start_time = os_time_get_nano();
+   const int64_t deadline = start_time + 60000000000ll;
+   while (count) {
+      int64_t remaining = deadline - os_time_get_nano();
+      if (remaining <= 0) {
+         mesa_loge("kbase: timed out waiting for %u JD atoms after %.2f ms", count,
+                   (os_time_get_nano() - start_time) / 1000000.0);
+         return VK_ERROR_DEVICE_LOST;
+      }
+
+      struct pollfd pfd = { .fd = dev->kmod.dev->fd, .events = POLLIN };
+      int ret = poll(&pfd, 1, (remaining + 999999) / 1000000);
+      if (ret < 0 && errno == EINTR)
+         continue;
+      if (ret <= 0 || !(pfd.revents & POLLIN))
+         return VK_ERROR_DEVICE_LOST;
+
+      struct base_jd_event_v2 ev;
+      ssize_t len = read(dev->kmod.dev->fd, &ev, sizeof(ev));
+      if (len < 0 && (errno == EINTR || errno == EAGAIN))
+         continue;
+      if (len != sizeof(ev)) {
+         mesa_loge("kbase: invalid JD event read length %zd", len);
+         return VK_ERROR_DEVICE_LOST;
+      }
+
+       if (unlikely(getenv("PANVK_VERBOSE")))
+          fprintf(stderr, "PANVKDBG JD_EVENT: atom=%u code=0x%02x count=%u udata=0x%llx,0x%llx\n",
+                  ev.atom_number, ev.event_code, count,
+                  (unsigned long long)ev.udata[0], (unsigned long long)ev.udata[1]);
+      if (!pending[ev.atom_number]) {
+         mesa_loge("kbase: unexpected JD event for atom %u", ev.atom_number);
+         return VK_ERROR_DEVICE_LOST;
+      }
+
+      pending[ev.atom_number] = false;
+      count--;
+      if (ev.event_code != BASE_JD_EVENT_DONE) {
+         mesa_loge("kbase: atom %u failed with JD event 0x%02x after %.2f ms (udata=0x%llx,0x%llx)",
+                   ev.atom_number, ev.event_code,
+                   (os_time_get_nano() - start_time) / 1000000.0,
+                   (unsigned long long)ev.udata[0], (unsigned long long)ev.udata[1]);
+         result = VK_ERROR_DEVICE_LOST;
+      }
+   }
+
+   return result;
+}
+
+static VkResult
+panvk_kbase_jm_prepare_batch(struct panvk_gpu_queue *queue,
+                             struct panvk_cmd_buffer *cmdbuf,
+                             struct panvk_batch *batch,
+                             struct panvk_kbase_jm_prepared_batch *prep)
+{
+   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+
+   if (unlikely(getenv("PANVK_VERBOSE")))
+      fprintf(stderr, "PANVKDBG submit_batch kbase: batch=%p vtc=%s frag=%s\n",
+              (void *)batch,
+              batch->vtc_jc.first_job ? "Y" : "N",
+              batch->frag_jc.first_job ? "Y" : "N");
+   mesa_logd("panvk: submit_batch start vtc=%s frag=%s",
+             batch->vtc_jc.first_job ? "yes" : "no",
+             batch->frag_jc.first_job ? "yes" : "no");
+
+   if (batch->issued && panvk_kbase_async_is_enabled(dev) &&
+       cmdbuf->async_seqno) {
+      /* Re-submitting a batch whose previous execution may still be in
+       * flight: wait for it before touching job memory. */
+      VkResult wres = panvk_kbase_async_wait_seqno(
+         dev, cmdbuf->async_seqno, UINT64_MAX);
+      if (wres != VK_SUCCESS)
+         return wres;
+   }
+
+   if (batch->issued) {
+      /*
+       * PANVKDBG JOB384:
+       * Inspect the complete Valhall MALLOC_VERTEX job after its previous
+       * execution and BEFORE clearing the 16-byte GPU-written job status.
+       */
+      if (unlikely(getenv("PANVK_VERBOSE"))) {
+         if (batch->vtc_jc.first_job) {
+            const uint32_t *j384 =
+               (const uint32_t *)(uintptr_t)batch->vtc_jc.first_job;
+
+            fprintf(stderr,
+                    "PANVKDBG JOB384_PRE_RESET batch=%p ptr=%016llx\n",
+                    (void *)batch,
+                    (unsigned long long)batch->vtc_jc.first_job);
+
+            for (unsigned i = 0; i < 96; i += 8) {
+               fprintf(stderr,
+                       "PANVKDBG JOB384_PRE_RESET W%02u "
+                       "%08x %08x %08x %08x "
+                       "%08x %08x %08x %08x\n",
+                       i,
+                       j384[i + 0], j384[i + 1],
+                       j384[i + 2], j384[i + 3],
+                       j384[i + 4], j384[i + 5],
+                       j384[i + 6], j384[i + 7]);
+            }
+         }
+
+         if (batch->tiler.ctx_descs.cpu) {
+            const uint32_t *tc_pre =
+               (const uint32_t *)batch->tiler.ctx_descs.cpu;
+
+            uint64_t q0 = ((uint64_t)tc_pre[1] << 32) | tc_pre[0];
+            uint64_t q1 = ((uint64_t)tc_pre[3] << 32) | tc_pre[2];
+
+            fprintf(stderr,
+                    "PANVKDBG REUSE_PRE_RESET_TC batch=%p "
+                    "q0=%016llx q1=%016llx "
+                    "w=%08x %08x %08x %08x %08x %08x %08x %08x\n",
+                    (void *)batch,
+                    (unsigned long long)q0,
+                    (unsigned long long)q1,
+                    tc_pre[0], tc_pre[1], tc_pre[2], tc_pre[3],
+                    tc_pre[4], tc_pre[5], tc_pre[6], tc_pre[7]);
+         }
+      }
+
+      /* GPU writes status/context data into the descriptor pool.
+       * Invalidate CPU mappings before restoring descriptors for re-submit. */
+      panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
+      pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+
+      /*
+       * Re-submit reset.
+       *
+       * The first 16 bytes of JOB_HEADER are GPU-written status.
+       * On Valhall, MALLOC_VERTEX also writes Draw.Vertex array
+       * (descriptor words 34..36). Restore that input state for
+       * every MALLOC_VERTEX in the batch, not only first_job.
+       */
+#if PAN_ARCH >= 9
+      unsigned reset_mv_idx = 0;
+#endif
+
+      util_dynarray_foreach(&batch->jobs, void *, job) {
+         uint32_t *j = (uint32_t *)(*job);
+
+#if PAN_ARCH >= 9
+         /*
+          * MALLOC_VERTEX is Valhall/PAN_ARCH >= 9.
+          * Save the type before clearing the GPU-written status.
+          */
+         uint8_t job_type = (j[4] >> 1) & 0x7f;
+#endif
+
+         memset(j, 0, 4 * 4);
+
+#if PAN_ARCH >= 9
+         if (job_type == MALI_JOB_TYPE_MALLOC_VERTEX) {
+            if (unlikely(getenv("PANVK_VERBOSE")))
+               fprintf(stderr,
+                       "PANVKDBG RESET_MV_ALL idx=%u ptr=%p "
+                       "before=%08x %08x %08x\n",
+                       reset_mv_idx, *job,
+                       j[34], j[35], j[36]);
+
+            /*
+             * Restore the pristine Draw.Vertex array input.
+             * The MALLOC_VERTEX hardware overwrites these words.
+             */
+            /*
+             * MALLOC_VERTEX writes Draw.Vertex Array during execution.
+             * Re-pack its pristine input state before re-submitting the
+             * recorded command buffer.  At command generation time PanVK
+             * initializes only Packet=true; Pointer and both strides are
+             * hardware outputs and therefore start at zero.
+             */
+            struct mali_vertex_array_packed *vertex_array =
+               (struct mali_vertex_array_packed *)&j[34];
+
+            pan_pack(vertex_array, VERTEX_ARRAY, cfg) {
+               cfg.packet = true;
+            }
+
+            if (unlikely(getenv("PANVK_VERBOSE")))
+               fprintf(stderr,
+                       "PANVKDBG RESET_MV_ALL idx=%u ptr=%p "
+                       "after=%08x %08x %08x\n",
+                       reset_mv_idx, *job,
+                       j[34], j[35], j[36]);
+
+            reset_mv_idx++;
+         }
+#endif
+      }
+
+      if (batch->tiler.ctx_descs.cpu) {
+         memcpy(batch->tiler.heap_desc.cpu, &batch->tiler.heap_templ,
+                sizeof(batch->tiler.heap_templ));
+
+         struct mali_tiler_context_packed *ctxs =
+            batch->tiler.ctx_descs.cpu;
+
+         for (uint32_t i = 0; i < batch->fb.layer_count; i++)
+            memcpy(&ctxs[i], &batch->tiler.ctx_templ, sizeof(*ctxs));
+      }
+
+      panvk_pool_flush_maps(&cmdbuf->desc_pool);
+   }
+
+   pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+
+   if (unlikely(getenv("PANVK_VERBOSE"))) {
+      /* Debug: compare the exact first job before first submit and re-submit. */
+      fprintf(stderr,
+              "PANVKDBG PRESUB issued=%u batch=%p vtc=%016llx frag=%016llx\n",
+              batch->issued ? 1 : 0, (void *)batch,
+              (unsigned long long)batch->vtc_jc.first_job,
+              (unsigned long long)batch->frag_jc.first_job);
+
+      if (batch->vtc_jc.first_job) {
+         const uint32_t *j =
+            (const uint32_t *)(uintptr_t)batch->vtc_jc.first_job;
+
+         fprintf(stderr,
+                 "PANVKDBG VTC16 "
+                 "%08x %08x %08x %08x "
+                 "%08x %08x %08x %08x "
+                 "%08x %08x %08x %08x "
+                 "%08x %08x %08x %08x\n",
+                 j[0], j[1], j[2], j[3],
+                 j[4], j[5], j[6], j[7],
+                 j[8], j[9], j[10], j[11],
+                 j[12], j[13], j[14], j[15]);
+      }
+
+      if (batch->tiler.heap_desc.cpu) {
+         const uint32_t *h =
+            (const uint32_t *)batch->tiler.heap_desc.cpu;
+
+         const uint32_t *ht =
+            (const uint32_t *)&batch->tiler.heap_templ;
+
+         fprintf(stderr,
+                 "PANVKDBG HEAP gpu=%016llx "
+                 "%08x %08x %08x %08x "
+                 "%08x %08x %08x %08x "
+                 "%08x %08x %08x %08x "
+                 "%08x %08x %08x %08x\n",
+                 (unsigned long long)batch->tiler.heap_desc.gpu,
+                 h[0], h[1], h[2], h[3],
+                 h[4], h[5], h[6], h[7],
+                 h[8], h[9], h[10], h[11],
+                 h[12], h[13], h[14], h[15]);
+
+         fprintf(stderr,
+                 "PANVKDBG HEAPT "
+                 "%08x %08x %08x %08x "
+                 "%08x %08x %08x %08x "
+                 "%08x %08x %08x %08x "
+                 "%08x %08x %08x %08x\n",
+                 ht[0], ht[1], ht[2], ht[3],
+                 ht[4], ht[5], ht[6], ht[7],
+                 ht[8], ht[9], ht[10], ht[11],
+                 ht[12], ht[13], ht[14], ht[15]);
+      }
+
+      if (batch->tiler.ctx_descs.cpu) {
+         const uint32_t *tc =
+            (const uint32_t *)batch->tiler.ctx_descs.cpu;
+
+         fprintf(stderr,
+                 "PANVKDBG TC16 "
+                 "%08x %08x %08x %08x "
+                 "%08x %08x %08x %08x "
+                 "%08x %08x %08x %08x "
+                 "%08x %08x %08x %08x\n",
+                 tc[0], tc[1], tc[2], tc[3],
+                 tc[4], tc[5], tc[6], tc[7],
+                 tc[8], tc[9], tc[10], tc[11],
+                 tc[12], tc[13], tc[14], tc[15]);
+      }
+
+      {
+         unsigned dbg_idx = 0;
+
+         util_dynarray_foreach(&batch->jobs, void *, job) {
+            const uint32_t *w = (const uint32_t *)(*job);
+
+            fprintf(stderr,
+                    "PANVKDBG JOB issued=%u idx=%u ptr=%p "
+                    "%08x %08x %08x %08x "
+                    "%08x %08x %08x %08x "
+                    "%08x %08x %08x %08x "
+                    "%08x %08x %08x %08x "
+                    "%08x %08x %08x %08x "
+                    "%08x %08x %08x %08x "
+                    "%08x %08x %08x %08x "
+                    "%08x %08x %08x %08x\n",
+                    batch->issued ? 1 : 0, dbg_idx++, *job,
+                    w[0], w[1], w[2], w[3],
+                    w[4], w[5], w[6], w[7],
+                    w[8], w[9], w[10], w[11],
+                    w[12], w[13], w[14], w[15],
+                    w[16], w[17], w[18], w[19],
+                    w[20], w[21], w[22], w[23],
+                    w[24], w[25], w[26], w[27],
+                    w[28], w[29], w[30], w[31]);
+         }
+      }
+
+      if (batch->vtc_jc.first_job) {
+         const uint32_t *j384 =
+            (const uint32_t *)(uintptr_t)batch->vtc_jc.first_job;
+
+         fprintf(stderr,
+                 "PANVKDBG JOB384_PRESUB issued=%u batch=%p ptr=%016llx\n",
+                 batch->issued ? 1 : 0,
+                 (void *)batch,
+                 (unsigned long long)batch->vtc_jc.first_job);
+
+         for (unsigned i = 0; i < 96; i += 8) {
+            fprintf(stderr,
+                    "PANVKDBG JOB384_PRESUB issued=%u W%02u "
+                    "%08x %08x %08x %08x "
+                    "%08x %08x %08x %08x\n",
+                    batch->issued ? 1 : 0, i,
+                    j384[i + 0], j384[i + 1],
+                    j384[i + 2], j384[i + 3],
+                    j384[i + 4], j384[i + 5],
+                    j384[i + 6], j384[i + 7]);
+         }
+      }
+   }
+
+   /* A draw chain starts with a MALLOC_VERTEX (Valhall IDVS) job, which
+    * needs both the shader cores and the tiler: submitting it with only
+    * BASE_JD_REQ_T makes the job fail with JOB_AFFINITY_FAULT (0x44).
+    * Compute/NULL chains stay on the vertex/compute slot. */
+   uint32_t vtc_core = BASE_JD_REQ_CS | BASE_JD_REQ_T;
+   uint32_t frag_core = BASE_JD_REQ_FS;
+   if (batch->vtc_jc.first_job) {
+      /* Pick the job slot from the first job in the chain: compute (and
+       * NULL sync) jobs run on the vertex/compute slot, draw chains on
+       * the tiler slot. */
+      uint32_t w0 = ((uint32_t *)(uintptr_t)batch->vtc_jc.first_job)[4];
+      uint8_t job_type = (w0 >> 1) & 0x7f;
+      if (job_type == MALI_JOB_TYPE_COMPUTE || job_type == MALI_JOB_TYPE_NULL)
+         vtc_core = BASE_JD_REQ_CS;
+   }
+   if (unlikely(getenv("PANVK_VERBOSE")))
+      fprintf(stderr, "PANVKDBG core envraw vtc=%s frag=%s\n",
+              getenv("PANVK_KBASE_VTC_CORE"), getenv("PANVK_KBASE_FRAG_CORE"));
+   if (getenv("PANVK_KBASE_VTC_CORE"))
+      vtc_core = strtoul(getenv("PANVK_KBASE_VTC_CORE"), NULL, 0);
+   if (getenv("PANVK_KBASE_FRAG_CORE"))
+      frag_core = strtoul(getenv("PANVK_KBASE_FRAG_CORE"), NULL, 0);
+
+   uint64_t userbuf_vas[BASE_EXT_RES_COUNT_MAX];
+   struct base_external_resource extres[BASE_EXT_RES_COUNT_MAX];
+
+   unsigned nr_extres =
+      kbase_kmod_get_user_buffer_vas(dev->kmod.dev,
+                                     userbuf_vas,
+                                     ARRAY_SIZE(userbuf_vas));
+
+   for (unsigned i = 0; i < nr_extres; i++) {
+      assert((userbuf_vas[i] & 0xfff) == 0);
+      extres[i].ext_resource =
+         userbuf_vas[i] | BASE_EXT_RES_ACCESS_EXCLUSIVE;
+
+      if (unlikely(getenv("PANVK_VERBOSE")))
+         fprintf(stderr,
+                 "PANVKDBG EXTRES[%u]=%016llx\n",
+                 i,
+                 (unsigned long long)extres[i].ext_resource);
+   }
+
+   prep->cmdbuf = cmdbuf;
+   prep->batch = batch;
+   prep->vtc_core = vtc_core;
+   prep->frag_core = frag_core;
+   prep->nr_extres = nr_extres;
+   memcpy(prep->extres, extres, sizeof(prep->extres));
+
+   return VK_SUCCESS;
+}
+
+/* Submit one prepared batch exactly like the historical per-batch path
+ * (split or joint). Used when batch merging is disabled. */
+static VkResult
+panvk_kbase_jm_submit_prepared(struct panvk_device *dev,
+                               const struct panvk_kbase_jm_prepared_batch *prep)
+{
+   struct panvk_cmd_buffer *cmdbuf = prep->cmdbuf;
+   struct panvk_batch *batch = prep->batch;
+   uint32_t vtc_core = prep->vtc_core;
+   uint32_t frag_core = prep->frag_core;
+   ASSERTED int ret;
+
+   bool use_split = (getenv("PANVK_SPLIT_SUBMIT") ||
+                     getenv("PANVK_SPLIT_MASK") ||
+#if PAN_ARCH >= 9
+                     true
+#else
+                     false
+#endif
+                    ) && !getenv("PANVK_NO_SPLIT");
+
+   if (use_split && batch->vtc_jc.first_job &&
+       batch->frag_jc.first_job) {
+      /* Submit vertex/tiler atom first, wait for completion, then submit fragment atom. */
+      struct base_jd_atom_v2 vatom = {
+         .jc = batch->vtc_jc.first_job,
+         .atom_number = 1,
+         .core_req = vtc_core,
+      };
+      if (prep->nr_extres) {
+         vatom.extres_list = (uint64_t)(uintptr_t)prep->extres;
+         vatom.nr_extres = prep->nr_extres;
+         vatom.core_req |= BASE_JD_REQ_EXTERNAL_RESOURCES;
+      }
+      struct kbase_ioctl_job_submit vsub = {
+         .addr = (uint64_t)(uintptr_t)&vatom,
+         .nr_atoms = 1,
+         .stride = sizeof(vatom),
+      };
+      ret = pan_kmod_ioctl(dev->kmod.dev->fd, KBASE_IOCTL_JOB_SUBMIT, &vsub);
+      if (ret) {
+         mesa_loge("kbase: vtc submit failed: %s", strerror(errno));
+         return VK_ERROR_DEVICE_LOST;
+      }
+      VkResult result = panvk_kbase_wait_jobs(dev, &vatom, 1);
+      if (result != VK_SUCCESS)
+         return result;
+
+      if (batch->tiler.ctx_descs.cpu) {
+         panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
+         pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+         uint32_t *tc = (uint32_t *)batch->tiler.ctx_descs.cpu;
+         uint64_t poly = ((uint64_t)tc[1] << 32) | tc[0];
+         if (unlikely(getenv("PANVK_VERBOSE"))) {
+            fprintf(stderr, "PANVKDBG SPLIT vtc done: poly=%016llx tc[2]=%08x tc[3]=%08x heap=%08x%08x\n",
+                    (unsigned long long)poly, tc[2], tc[3], tc[7], tc[6]);
+         }
+         /* Do NOT mask poly pointer tag bits by default; Valhall JM tiler hardware tag bits
+          * (0x00ff) in bits 48..55 are required by the fragment frontend. */
+         if (getenv("PANVK_SPLIT_DOMASK")) {
+            uint64_t masked = poly & 0x0000ffffffffffffull;
+            tc[0] = (uint32_t)masked;
+            tc[1] = (uint32_t)(masked >> 32);
+            panvk_pool_flush_maps(&cmdbuf->desc_pool);
+            pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+         }
+      }
+
+      struct base_jd_atom_v2 fatom = {
+         .jc = batch->frag_jc.first_job,
+         .atom_number = 2,
+         .core_req = frag_core,
+      };
+      if (prep->nr_extres) {
+         fatom.extres_list = (uint64_t)(uintptr_t)prep->extres;
+         fatom.nr_extres = prep->nr_extres;
+         fatom.core_req |= BASE_JD_REQ_EXTERNAL_RESOURCES;
+      }
+      struct kbase_ioctl_job_submit fsub = {
+         .addr = (uint64_t)(uintptr_t)&fatom,
+         .nr_atoms = 1,
+         .stride = sizeof(fatom),
+      };
+      ret = pan_kmod_ioctl(dev->kmod.dev->fd, KBASE_IOCTL_JOB_SUBMIT, &fsub);
+      if (ret) {
+         mesa_loge("kbase: frag submit failed: %s", strerror(errno));
+         return VK_ERROR_DEVICE_LOST;
+      }
+      result = panvk_kbase_wait_jobs(dev, &fatom, 1);
+      if (result != VK_SUCCESS) {
+         panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
+         pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+          if (batch->tiler.ctx_descs.cpu) {
+             const uint32_t *tc = (const uint32_t *)batch->tiler.ctx_descs.cpu;
+             fprintf(stderr,
+                     "PANVKDBG split failed tiler ctx: poly=%08x%08x mask=%08x fbw=%u fbh=%u heap=%08x%08x\n",
+                     tc[1], tc[0], tc[2], (tc[3] & 0xffff) + 1, ((tc[3] >> 16) & 0xffff) + 1, tc[7], tc[6]);
+          }
+         if (batch->fb.desc.cpu) {
+            const uint32_t *f = (const uint32_t *)batch->fb.desc.cpu;
+            fprintf(stderr, "PANVKDBG split failed FBD[0..7]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                    f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
+            fprintf(stderr, "PANVKDBG split failed FBD[8..15]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                    f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
+            fprintf(stderr, "PANVKDBG split failed FBD[16..31]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                    f[16], f[17], f[18], f[19], f[20], f[21], f[22], f[23]);
+            fprintf(stderr, "PANVKDBG split failed RT0[0..7]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                    f[32], f[33], f[34], f[35], f[36], f[37], f[38], f[39]);
+            fprintf(stderr, "PANVKDBG split failed RT0[8..15]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                    f[40], f[41], f[42], f[43], f[44], f[45], f[46], f[47]);
+         }
+         fprintf(stderr, "PANVKDBG split failed info: nr_extres=%u fatom_core_req=%08x\n",
+                 prep->nr_extres, fatom.core_req);
+         for (unsigned i = 0; i < prep->nr_extres; i++) {
+            fprintf(stderr, "PANVKDBG split failed extres[%u]=%016llx\n",
+                    i, (unsigned long long)prep->extres[i].ext_resource);
+         }
+         if (dev->debug.decode_ctx) {
+            if (batch->vtc_jc.first_job)
+               pandecode_jc(dev->debug.decode_ctx, batch->vtc_jc.first_job,
+                            to_panvk_physical_device(dev->vk.physical)->kmod.dev->props.gpu_id);
+            if (batch->frag_jc.first_job)
+               pandecode_jc(dev->debug.decode_ctx, batch->frag_jc.first_job,
+                            to_panvk_physical_device(dev->vk.physical)->kmod.dev->props.gpu_id);
+         }
+         util_dynarray_foreach(&batch->jobs, void *, job) {
+            const uint32_t *h = *job;
+            fprintf(stderr,
+                    "PANVKDBG split failed job: status=%08x task=%08x "
+                    "fault=%08x%08x type_index=%08x\n",
+                    h[0], h[1], h[3], h[2], h[4]);
+            fprintf(stderr,
+                    "PANVKDBG job payload: w5=%08x next=%08x%08x w8=%08x w9=%08x fbd=%08x%08x\n",
+                    h[5], h[7], h[6], h[8], h[9], h[11], h[10]);
+            uint64_t fault = ((uint64_t)h[3] << 32) | h[2];
+            if (fault && dev->tiler_heap && dev->tiler_heap->addr.host) {
+               uint64_t base = dev->tiler_heap->addr.dev;
+               uint64_t size = pan_kmod_bo_size(dev->tiler_heap->bo);
+               if (fault >= base && (fault - base) < size) {
+                  uint64_t off = fault - base;
+                  const uint32_t *pw = (const uint32_t *)(dev->tiler_heap->addr.host + off);
+                  fprintf(stderr, "PANVKDBG fault mem @%016llx (off=%llx): %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                          (unsigned long long)fault, (unsigned long long)off,
+                          pw[0], pw[1], pw[2], pw[3], pw[4], pw[5], pw[6], pw[7]);
+               }
+            }
+         }
+         return result;
+      }
+      batch->issued = true;
+      return VK_SUCCESS;
+   }
+
+   {
+      /* Submit the (optional) vertex/tiler chain and the (optional) fragment
+       * chain as atoms in a single kbase job bag.  The fragment atom declares
+       * a data dependency on the vertex/tiler atom so the scheduler keeps the
+       * tiler->fragment ordering the hardware requires. */
+      struct base_jd_atom_v2 atoms[2];
+      unsigned nr_atoms = 0;
+
+      memset(atoms, 0, sizeof(atoms));
+
+      if (batch->vtc_jc.first_job) {
+         atoms[nr_atoms].jc = batch->vtc_jc.first_job;
+         atoms[nr_atoms].atom_number = 1;
+         atoms[nr_atoms].core_req = vtc_core;
+
+         if (prep->nr_extres) {
+            atoms[nr_atoms].extres_list =
+               (uint64_t)(uintptr_t)prep->extres;
+            atoms[nr_atoms].nr_extres = prep->nr_extres;
+            atoms[nr_atoms].core_req |= BASE_JD_REQ_EXTERNAL_RESOURCES;
+
+            if (unlikely(getenv("PANVK_VERBOSE")))
+               fprintf(stderr,
+                       "PANVKDBG VTC EXTRES count=%u core_req=%08x list=%p\n",
+                       prep->nr_extres,
+                       atoms[nr_atoms].core_req,
+                       (void *)prep->extres);
+         }
+
+         nr_atoms++;
+      }
+
+      if (batch->frag_jc.first_job) {
+         atoms[nr_atoms].jc = batch->frag_jc.first_job;
+         atoms[nr_atoms].atom_number = 2;
+         if (batch->vtc_jc.first_job) {
+            atoms[nr_atoms].pre_dep[0].atom_id = 1;
+            atoms[nr_atoms].pre_dep[0].dependency_type = 1; /* DATA */
+         }
+         atoms[nr_atoms].core_req = frag_core;
+
+         if (prep->nr_extres) {
+            atoms[nr_atoms].extres_list =
+               (uint64_t)(uintptr_t)prep->extres;
+            atoms[nr_atoms].nr_extres = prep->nr_extres;
+            atoms[nr_atoms].core_req |= BASE_JD_REQ_EXTERNAL_RESOURCES;
+
+            if (unlikely(getenv("PANVK_VERBOSE")))
+               fprintf(stderr,
+                       "PANVKDBG FRAG EXTRES count=%u core_req=%08x list=%p\n",
+                       prep->nr_extres,
+                       atoms[nr_atoms].core_req,
+                       (void *)prep->extres);
+         }
+
+         nr_atoms++;
+      }
+
+      if (nr_atoms) {
+         struct kbase_ioctl_job_submit submit = {
+            .addr = (uint64_t)(uintptr_t)atoms,
+            .nr_atoms = nr_atoms,
+            .stride = sizeof(atoms[0]),
+         };
+
+         if (PANVK_DEBUG(TRACE)) {
+            panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
+            pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+            if (batch->vtc_jc.first_job)
+               pandecode_jc(dev->debug.decode_ctx, batch->vtc_jc.first_job,
+                            to_panvk_physical_device(dev->vk.physical)->kmod.dev->props.gpu_id);
+            if (batch->frag_jc.first_job)
+               pandecode_jc(dev->debug.decode_ctx, batch->frag_jc.first_job,
+                            to_panvk_physical_device(dev->vk.physical)->kmod.dev->props.gpu_id);
+         }
+
+         ret = pan_kmod_ioctl(dev->kmod.dev->fd, KBASE_IOCTL_JOB_SUBMIT, &submit);
+         if (ret) {
+            mesa_loge("kbase: KBASE_IOCTL_JOB_SUBMIT failed: %s", strerror(errno));
+            return VK_ERROR_DEVICE_LOST;
+         }
+         if (unlikely(getenv("PANVK_VERBOSE")))
+            fprintf(stderr,
+                    "PANVKDBG JD submit ok vtc=%s frag=%s atoms=%u vtc_core=%x frag_core=%x\n",
+                    batch->vtc_jc.first_job ? "Y" : "N",
+                    batch->frag_jc.first_job ? "Y" : "N", nr_atoms, vtc_core,
+                    frag_core);
+         mesa_logd("panvk: job bag submit ok");
+
+         VkResult result = panvk_kbase_wait_jobs(dev, atoms, nr_atoms);
+
+         if (unlikely(getenv("PANVK_VERBOSE"))) {
+            if (result == VK_SUCCESS && batch->frag_jc.first_job) {
+               fprintf(stderr,
+                       "PANVKDBG FRAG DONE: dumping native BOs\n");
+               kbase_kmod_debug_dump_native_bos(dev->kmod.dev);
+            }
+
+            if (result == VK_SUCCESS && batch->vtc_jc.first_job) {
+               fprintf(stderr,
+                       "PANVKDBG VTC DONE: dumping USER_BUFFER mappings\n");
+               kbase_kmod_debug_dump_user_buffers(dev->kmod.dev);
+            }
+         }
+
+         if (result != VK_SUCCESS) {
+            panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
+            pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+            util_dynarray_foreach(&batch->jobs, void *, job) {
+               const uint32_t *h = *job;
+               fprintf(stderr,
+                       "PANVKDBG failed batch job: status=%08x task=%08x "
+                       "fault=%08x%08x type_index=%08x\n",
+                       h[0], h[1], h[3], h[2], h[4]);
+               fprintf(stderr,
+                       "PANVKDBG job payload: w5=%08x next=%08x%08x w8=%08x w9=%08x fbd=%08x%08x\n",
+                       h[5], h[7], h[6], h[8], h[9], h[11], h[10]);
+            }
+            if (batch->tiler.ctx_descs.cpu) {
+               const uint32_t *tc = (const uint32_t *)batch->tiler.ctx_descs.cpu;
+               fprintf(stderr,
+                       "PANVKDBG tiler ctx: poly=%08x%08x mask=%08x fbw=%u fbh=%u heap=%08x%08x\n",
+                       tc[1], tc[0], tc[2], (tc[3] & 0xffff) + 1, ((tc[3] >> 16) & 0xffff) + 1, tc[7], tc[6]);
+            }
+            return result;
+         }
+      }
+   }
+
+   if (getenv("PANVK_DUMP_HEAP") && batch->tiler.ctx_descs.cpu) {
+      const uint32_t *tc = (const uint32_t *)batch->tiler.ctx_descs.cpu;
+      uint64_t poly = ((uint64_t)tc[1] << 32) | tc[0];
+      uint64_t heap = ((uint64_t)tc[7] << 32) | tc[6];
+      fprintf(stderr,
+              "PANVKDBG tiler ctx: poly_list=%016llx heap_desc=%016llx (tc[2]=%08x)\n",
+              (unsigned long long)poly, (unsigned long long)heap, tc[2]);
+      if (dev->tiler_heap && dev->tiler_heap->addr.host) {
+         uint64_t base = dev->tiler_heap->addr.dev;
+         uint64_t size = pan_kmod_bo_size(dev->tiler_heap->bo);
+         fprintf(stderr,
+                 "PANVKDBG heap: base=%016llx size=%llx poly_off=%llx\n",
+                 (unsigned long long)base, (unsigned long long)size,
+                 (unsigned long long)(poly - base));
+         if (batch->tiler.heap_desc.cpu) {
+            const uint32_t *hd = (const uint32_t *)batch->tiler.heap_desc.cpu;
+            fprintf(stderr,
+                    "PANVKDBG heap_desc: w0=%08x w1=%08x w2=%08x w3=%08x w4=%08x w5=%08x w6=%08x w7=%08x\n",
+                    hd[0], hd[1], hd[2], hd[3], hd[4], hd[5], hd[6], hd[7]);
+         }
+         unsigned char *h = dev->tiler_heap->addr.host;
+         uint64_t masked = poly & 0x0000ffffffffffffull;
+         if (masked >= base && (masked - base) < size) {
+            uint64_t page = (masked - base) & ~0xfffull;
+            panvk_priv_bo_invalidate(dev->tiler_heap, page, 0x2000);
+            for (unsigned i = 0; i < 0x2000; i += 16) {
+               const uint32_t *w = (const uint32_t *)(h + page + i);
+               if (!(w[0] | w[1] | w[2] | w[3]))
+                  continue;
+               fprintf(stderr, "PANVKDBG poly[%05llx] %08x %08x %08x %08x\n",
+                       (unsigned long long)(page + i), w[0], w[1], w[2], w[3]);
+            }
+         } else {
+            fprintf(stderr, "PANVKDBG poly masked=%016llx off=%lld out of range\n",
+                    (unsigned long long)masked, (long long)(masked - base));
+         }
+      }
+   }
+
+    batch->issued = true;
+    mesa_logd("panvk: submit_batch end");
+    return VK_SUCCESS;
+}
+
+static VkResult
+panvk_kbase_jm_submit_batch(struct panvk_gpu_queue *queue,
+                            struct panvk_cmd_buffer *cmdbuf,
+                            struct panvk_batch *batch, uint32_t *bos,
+                            unsigned nr_bos, uint32_t *in_fences,
+                            unsigned nr_in_fences)
+{
+   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+   struct panvk_kbase_jm_prepared_batch prep;
+   VkResult result;
+
+   (void)bos;
+   (void)nr_bos;
+   (void)in_fences;
+   (void)nr_in_fences;
+
+   result = panvk_kbase_jm_prepare_batch(queue, cmdbuf, batch, &prep);
+   if (result != VK_SUCCESS)
+      return result;
+
+   return panvk_kbase_jm_submit_prepared(dev, &prep);
+}
+
+/* Heap-split overlap (PANVK_OVERLAP=1, default off): consecutive batches use
+ * disjoint tiler heap halves so a vertex job only waits for the fragment job
+ * that owns its half. Mirrors the FristOneRR v67b design (within one bag). */
+static bool
+panvk_overlap_enabled(void)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *e = getenv("PANVK_OVERLAP");
+      on = (e && e[0] != '0') ? 1 : 0;
+   }
+   return on != 0;
+}
+
+/* Submit-nowait (FristOneRR v51 model): route plain-async submits through
+ * the multi-bag builder with one strict linear chain across bags (no
+ * heap-half relaxation). Atoms stay fully ordered so the newest covers all
+ * earlier ones; the CPU never waits on the submit path. Requires
+ * PANVK_ASYNC=1; PANVK_OVERLAP=1 keeps the relaxed heap-half edges. */
+static bool
+panvk_nowait_enabled(void)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *e = getenv("PANVK_SUBMIT_NOWAIT");
+      on = (e && e[0] != '0') ? 1 : 0;
+   }
+   return on != 0;
+}
+
+/* Maximum batches merged into one job bag. Each batch contributes up to two
+ * atoms; atom numbers are bytes and the wait path tracks 256 of them. */
+#define PANVK_KBASE_JM_MERGE_MAX_BATCHES 120
+
+/* Submit many prepared batches as a single kbase job bag with a linear
+ * dependency chain (each atom depends on the previous one), then wait once.
+ * This preserves the exact execution order of per-batch submits while
+ * collapsing N submit+wait round trips into one. Lifetimes are unchanged:
+ * everything is still waited on before returning. */
+static VkResult
+panvk_kbase_jm_submit_merged(struct panvk_device *dev,
+                             struct vk_queue *vk_queue,
+                             struct panvk_kbase_jm_prepared_batch *preps,
+                             unsigned nr_preps)
+{
+   struct base_jd_atom_v2 *atoms =
+      malloc(sizeof(*atoms) * 2 * nr_preps);
+   struct panvk_batch **atom_batch =
+      malloc(sizeof(*atom_batch) * 2 * nr_preps);
+   if (!atoms || !atom_batch) {
+      free(atoms);
+      free(atom_batch);
+      return vk_queue_set_lost(vk_queue, "kbase JM merged submit OOM");
+   }
+
+   unsigned nr_atoms = 0;
+   uint8_t prev_atom = 0;
+   /* Heap-split overlap: last frag atom per heap half, valid within this bag.
+    * A vertex job only waits for the fragment job that owns its half. */
+   const bool overlap = panvk_overlap_enabled();
+   uint8_t half_frag[2] = { 0, 0 };
+   for (unsigned b = 0; b < nr_preps; b++) {
+      struct panvk_batch *batch = preps[b].batch;
+
+      if (batch->vtc_jc.first_job) {
+         struct base_jd_atom_v2 *a = &atoms[nr_atoms];
+         memset(a, 0, sizeof(*a));
+         a->jc = batch->vtc_jc.first_job;
+         a->atom_number = nr_atoms + 1;
+         a->core_req = preps[b].vtc_core;
+         if (prev_atom) {
+            uint8_t dep = prev_atom;
+            if (overlap && batch->frag_jc.first_job) {
+               uint8_t h = half_frag[batch->heap_half & 1];
+               if (h)
+                  dep = h;
+            }
+            a->pre_dep[0].atom_id = dep;
+            a->pre_dep[0].dependency_type = 1; /* DATA */
+         }
+         if (preps[b].nr_extres) {
+            a->extres_list = (uint64_t)(uintptr_t)preps[b].extres;
+            a->nr_extres = preps[b].nr_extres;
+            a->core_req |= BASE_JD_REQ_EXTERNAL_RESOURCES;
+         }
+         atom_batch[nr_atoms] = batch;
+         prev_atom = a->atom_number;
+         nr_atoms++;
+      }
+
+      if (batch->frag_jc.first_job) {
+         struct base_jd_atom_v2 *a = &atoms[nr_atoms];
+         memset(a, 0, sizeof(*a));
+         a->jc = batch->frag_jc.first_job;
+         a->atom_number = nr_atoms + 1;
+         a->core_req = preps[b].frag_core;
+         if (prev_atom) {
+            a->pre_dep[0].atom_id = prev_atom;
+            a->pre_dep[0].dependency_type = 1; /* DATA */
+         }
+         if (preps[b].nr_extres) {
+            a->extres_list = (uint64_t)(uintptr_t)preps[b].extres;
+            a->nr_extres = preps[b].nr_extres;
+            a->core_req |= BASE_JD_REQ_EXTERNAL_RESOURCES;
+         }
+         atom_batch[nr_atoms] = batch;
+         if (overlap)
+            half_frag[batch->heap_half & 1] = a->atom_number;
+         prev_atom = a->atom_number;
+         nr_atoms++;
+      }
+   }
+
+   VkResult result = VK_SUCCESS;
+   if (nr_atoms) {
+      struct kbase_ioctl_job_submit submit = {
+         .addr = (uint64_t)(uintptr_t)atoms,
+         .nr_atoms = nr_atoms,
+         .stride = sizeof(atoms[0]),
+      };
+
+      if (unlikely(getenv("PANVK_VERBOSE")))
+         fprintf(stderr, "PANVKDBG merged submit: batches=%u atoms=%u\n",
+                 nr_preps, nr_atoms);
+
+      int ret = pan_kmod_ioctl(dev->kmod.dev->fd, KBASE_IOCTL_JOB_SUBMIT,
+                               &submit);
+      if (ret) {
+         mesa_loge("kbase: merged KBASE_IOCTL_JOB_SUBMIT failed: %s",
+                   strerror(errno));
+         result = VK_ERROR_DEVICE_LOST;
+      } else {
+         result = panvk_kbase_wait_jobs(dev, atoms, nr_atoms);
+      }
+
+      if (result != VK_SUCCESS) {
+         /* Identify the culprit batch by GPU-written job status. */
+         for (unsigned b = 0; b < nr_preps; b++) {
+            struct panvk_batch *batch = preps[b].batch;
+            util_dynarray_foreach(&batch->jobs, void *, job) {
+               const uint32_t *h = *job;
+               fprintf(stderr,
+                       "PANVKDBG merged failed batch=%p job: status=%08x task=%08x "
+                       "fault=%08x%08x type_index=%08x\n",
+                       (void *)batch, h[0], h[1], h[3], h[2], h[4]);
+            }
+         }
+      }
+   }
+
+   free(atoms);
+   free(atom_batch);
+
+   if (result != VK_SUCCESS)
+      return vk_queue_set_lost(vk_queue, "kbase JM merged submission failed");
+
+    for (unsigned b = 0; b < nr_preps; b++)
+       preps[b].batch->issued = true;
+
+    return VK_SUCCESS;
+}
+
+/* Build a single linear-chain job bag from prepared batches for async
+ * submission. Atoms and the flat extres array are heap-allocated; ownership
+ * of both passes to the caller (handed to the async engine, freed on
+ * retirement). Every atom depends on the previous one, preserving submit
+ * order exactly. */
+/* Overlap submitter (PANVK_OVERLAP=1 on top of PANVK_ASYNC=1): build the bag,
+ * assign globally-unique atom ids, wire the first vertex atom's second
+ * dependency to the in-flight fragment atom owning its tiler heap half, and
+ * submit — all under the async lock so cross-bag state stays ordered.
+ * Within-bag edges mirror the merged path. Returns the bag seqno, 0 on
+ * failure (caller must mark the device lost). */
+static uint64_t
+panvk_kbase_jm_submit_overlap(struct panvk_device *dev,
+                              struct panvk_kbase_jm_prepared_batch *preps,
+                              unsigned nr_preps,
+                              const int *wait_fds, unsigned nr_wait_fds)
+{
+   struct base_jd_atom_v2 *atoms =
+      calloc(nr_wait_fds + 2 * nr_preps, sizeof(*atoms));
+   struct base_external_resource (*extres)[BASE_EXT_RES_COUNT_MAX] =
+      malloc(sizeof(*extres) * nr_preps);
+   if (!atoms || !extres) {
+      free(atoms);
+      free(extres);
+      return 0;
+   }
+   struct panvk_kbase_jm_bag *bag = calloc(1, sizeof(*bag));
+   if (!bag) {
+      free(atoms);
+      free(extres);
+      return 0;
+   }
+   /* base_fence array for WAIT atoms, owned by the bag (freed on retire).
+    * Must outlive builder return: the kernel reads jc at submit time. */
+   struct kbase_base_fence *fences = NULL;
+   if (nr_wait_fds) {
+      fences = calloc(nr_wait_fds, sizeof(*fences));
+      if (!fences) {
+         free(atoms);
+         free(extres);
+         free(bag);
+         return 0;
+      }
+      for (unsigned k = 0; k < nr_wait_fds; k++) {
+         fences[k].fd = wait_fds[k];
+         fences[k].stream_fd = -1;
+      }
+   }
+
+   simple_mtx_lock(&dev->async.lock);
+
+   /* Debug throttle: serialize bags (drain first) while keeping global ids
+    * and cross-bag deps. Discriminates pipelining-depth bugs from mechanism
+    * bugs. */
+   static int serial = -1;
+   if (serial < 0)
+      serial = getenv("PANVK_OVERLAP_SERIAL") != NULL;
+   if (serial) {
+      while (dev->async.bags_head) {
+         uint64_t head = dev->async.bags_head->seqno;
+         simple_mtx_unlock(&dev->async.lock);
+         VkResult wr = panvk_kbase_async_wait_seqno(dev, head, UINT64_MAX);
+         simple_mtx_lock(&dev->async.lock);
+         if (wr != VK_SUCCESS) {
+            simple_mtx_unlock(&dev->async.lock);
+            free(atoms);
+            free(extres);
+            free(fences);
+            free(bag);
+            return 0;
+         }
+         struct panvk_kbase_jm_bag *retired[PANVK_KBASE_ASYNC_REAP_MAX];
+         unsigned nr_retired = 0;
+         panvk_kbase_async_reap_locked(dev, retired, &nr_retired);
+         simple_mtx_unlock(&dev->async.lock);
+         panvk_kbase_async_retire_bags(retired, nr_retired);
+         simple_mtx_lock(&dev->async.lock);
+      }
+   }
+
+   /* Reap, then ensure enough free atom ids (WAIT atoms + 2 per prep
+    * worst case). If short, wait for the oldest bag and retry. */
+   while (true) {
+      struct panvk_kbase_jm_bag *retired[PANVK_KBASE_ASYNC_REAP_MAX];
+      unsigned nr_retired = 0;
+      panvk_kbase_async_reap_locked(dev, retired, &nr_retired);
+      simple_mtx_unlock(&dev->async.lock);
+      panvk_kbase_async_retire_bags(retired, nr_retired);
+      simple_mtx_lock(&dev->async.lock);
+
+      unsigned free_ids = 0;
+      for (unsigned i = 1; i < 256; i++)
+         free_ids += dev->async.atom_bag[i] == NULL;
+      if (free_ids >= nr_wait_fds + 2 * nr_preps)
+         break;
+
+      uint64_t head = 0;
+      if (dev->async.bag)
+         head = dev->async.bag->seqno;
+      else if (dev->async.bags_head)
+         head = dev->async.bags_head->seqno;
+      simple_mtx_unlock(&dev->async.lock);
+      if (!head) {
+         simple_mtx_lock(&dev->async.lock);
+         continue;
+      }
+      VkResult wr = panvk_kbase_async_wait_seqno(dev, head, UINT64_MAX);
+      if (wr != VK_SUCCESS) {
+         free(atoms);
+         free(extres);
+         free(bag);
+         return 0;
+      }
+      simple_mtx_lock(&dev->async.lock);
+   }
+
+   if (dev->async.lost) {
+      simple_mtx_unlock(&dev->async.lock);
+      free(atoms);
+      free(extres);
+      free(bag);
+      return 0;
+   }
+
+   /* Allocate ids and build. WAIT atoms for imported foreign fences go
+    * first so all work chains behind them. In strict nowait mode the chain
+    * additionally starts from the previous bag's tail (validated below),
+    * giving one fully-ordered atom stream across submits. */
+   unsigned nr_atoms = 0;
+   uint8_t prev_atom = 0;
+   uint8_t half_frag[2] = { 0, 0 };
+   bool first_vtc = true;
+   bool first_frag = true;
+   const bool strict = panvk_nowait_enabled() && !dev->async.overlap;
+   if (strict) {
+      uint8_t tail = dev->async.last_atom;
+      if (tail && dev->async.atom_bag[tail])
+         prev_atom = tail;
+   }
+   for (unsigned k = 0; k < nr_wait_fds; k++) {
+      struct base_jd_atom_v2 *a = &atoms[nr_atoms];
+      memset(a, 0, sizeof(*a));
+      uint8_t id = 0;
+      for (unsigned t = 0; t < 256 && !id; t++) {
+         uint8_t cand = dev->async.next_atom++;
+         if (dev->async.next_atom == 0)
+            dev->async.next_atom = 1;
+         if (!dev->async.atom_bag[cand])
+            id = cand;
+      }
+      if (!id) {
+         simple_mtx_unlock(&dev->async.lock);
+         free(atoms);
+         free(extres);
+         free(fences);
+         free(bag);
+         return 0;
+      }
+      a->jc = (uint64_t)(uintptr_t)&fences[k];
+      a->atom_number = id;
+      a->core_req = KBASE_JD_REQ_SOFT_FENCE_WAIT;
+      if (prev_atom) {
+         a->pre_dep[0].atom_id = prev_atom;
+         a->pre_dep[0].dependency_type = 1; /* DATA */
+      }
+      dev->async.atom_bag[id] = bag;
+      dev->async.last_atom = id;
+      prev_atom = id;
+      nr_atoms++;
+   }
+   for (unsigned b = 0; b < nr_preps; b++) {
+      struct panvk_batch *batch = preps[b].batch;
+      memcpy(extres[b], preps[b].extres, sizeof(extres[b]));
+
+      if (batch->vtc_jc.first_job) {
+         struct base_jd_atom_v2 *a = &atoms[nr_atoms];
+         memset(a, 0, sizeof(*a));
+         uint8_t id = 0;
+         for (unsigned t = 0; t < 256 && !id; t++) {
+            uint8_t cand = dev->async.next_atom++;
+            if (dev->async.next_atom == 0)
+               dev->async.next_atom = 1;
+            if (!dev->async.atom_bag[cand])
+               id = cand;
+         }
+         if (!id) {
+            simple_mtx_unlock(&dev->async.lock);
+            free(atoms);
+            free(extres);
+            free(fences);
+            free(bag);
+            return 0;
+         }
+         a->jc = batch->vtc_jc.first_job;
+         a->atom_number = id;
+         a->core_req = preps[b].vtc_core;
+         if (prev_atom) {
+            a->pre_dep[0].atom_id = prev_atom;
+            a->pre_dep[0].dependency_type = 1; /* DATA */
+         }
+         if (first_vtc && batch->frag_jc.first_job && !strict) {
+            /* Cross-bag edge: wait only for the in-flight fragment job
+             * that owns this batch's heap half (0 = none/stale). Skipped
+             * in strict mode: the linear prev_atom chain already covers
+             * every earlier atom. */
+            uint8_t hid = dev->async.half_frag[batch->heap_half & 1];
+            if (hid && !dev->async.atom_bag[hid])
+               hid = 0;
+            if (hid && hid != a->pre_dep[0].atom_id) {
+               a->pre_dep[1].atom_id = hid;
+               a->pre_dep[1].dependency_type = 1; /* DATA */
+            }
+            first_vtc = false;
+         }
+         if (preps[b].nr_extres) {
+            a->extres_list = (uint64_t)(uintptr_t)&extres[b][0];
+            a->nr_extres = preps[b].nr_extres;
+            a->core_req |= BASE_JD_REQ_EXTERNAL_RESOURCES;
+         }
+         dev->async.atom_bag[id] = bag;
+         dev->async.last_atom = id;
+         prev_atom = id;
+         nr_atoms++;
+      }
+
+      if (batch->frag_jc.first_job) {
+         struct base_jd_atom_v2 *a = &atoms[nr_atoms];
+         memset(a, 0, sizeof(*a));
+         uint8_t id = 0;
+         for (unsigned t = 0; t < 256 && !id; t++) {
+            uint8_t cand = dev->async.next_atom++;
+            if (dev->async.next_atom == 0)
+               dev->async.next_atom = 1;
+            if (!dev->async.atom_bag[cand])
+               id = cand;
+         }
+         if (!id) {
+            simple_mtx_unlock(&dev->async.lock);
+            free(atoms);
+            free(extres);
+            free(fences);
+            free(bag);
+            return 0;
+         }
+         a->jc = batch->frag_jc.first_job;
+         a->atom_number = id;
+         a->core_req = preps[b].frag_core;
+         if (prev_atom) {
+            a->pre_dep[0].atom_id = prev_atom;
+            a->pre_dep[0].dependency_type = 1; /* DATA */
+         }
+         if (first_frag && !strict) {
+            /* Cross-bag edge: fragment work stays serialized across bags
+             * (matches the reference design); vertex work is what overlaps.
+             * Skipped in strict mode for the same reason as above. */
+            uint8_t fid = dev->async.last_frag;
+            if (fid && !dev->async.atom_bag[fid])
+               fid = 0;
+            if (fid && fid != a->pre_dep[0].atom_id) {
+               a->pre_dep[1].atom_id = fid;
+               a->pre_dep[1].dependency_type = 1; /* DATA */
+            }
+            first_frag = false;
+         }
+         if (preps[b].nr_extres) {
+            a->extres_list = (uint64_t)(uintptr_t)&extres[b][0];
+            a->nr_extres = preps[b].nr_extres;
+            a->core_req |= BASE_JD_REQ_EXTERNAL_RESOURCES;
+         }
+         dev->async.atom_bag[id] = bag;
+         half_frag[batch->heap_half & 1] = id;
+         dev->async.last_frag = id;
+         dev->async.last_atom = id;
+         prev_atom = id;
+         nr_atoms++;
+      }
+   }
+
+   uint64_t seqno = 0;
+   if (nr_atoms) {
+      struct kbase_ioctl_job_submit submit = {
+         .addr = (uint64_t)(uintptr_t)atoms,
+         .nr_atoms = nr_atoms,
+         .stride = sizeof(atoms[0]),
+      };
+      int ret = pan_kmod_ioctl(dev->kmod.dev->fd, KBASE_IOCTL_JOB_SUBMIT,
+                               &submit);
+      if (ret) {
+         mesa_loge("kbase overlap: KBASE_IOCTL_JOB_SUBMIT failed: %s",
+                   strerror(errno));
+         dev->async.lost = true;
+      } else {
+         bag->seqno = ++dev->async.seqno;
+         bag->atoms = atoms;
+         bag->extres_blob = extres;
+         bag->fence_data = fences;
+         fences = NULL;
+         bag->nr_atoms = nr_atoms;
+         bag->pending = nr_atoms;
+         bag->failed = false;
+         bag->done = false;
+         bag->next = NULL;
+         panvk_kbase_async_split_submit_locked(dev);
+         if (dev->async.bags_tail)
+            dev->async.bags_tail->next = bag;
+         else
+            dev->async.bags_head = bag;
+         dev->async.bags_tail = bag;
+         for (unsigned h = 0; h < 2; h++) {
+            if (half_frag[h])
+               dev->async.half_frag[h] = half_frag[h];
+         }
+         seqno = bag->seqno;
+         bag = NULL; /* owned by the engine now */
+         if (unlikely(getenv("PANVK_VERBOSE"))) {
+            unsigned inflight = 0;
+            for (struct panvk_kbase_jm_bag *bb = dev->async.bags_head;
+                 bb; bb = bb->next)
+               inflight++;
+            fprintf(stderr,
+                    "PANVKDBG ovsubmit seq=%llu atoms=%u inflight=%u halves=%u,%u\n",
+                    (unsigned long long)seqno, nr_atoms, inflight,
+                    dev->async.half_frag[0], dev->async.half_frag[1]);
+         }
+      }
+   } else {
+      /* No GPU work: link an already-done bag so sequencing stays exact. */
+      bag->seqno = ++dev->async.seqno;
+      bag->atoms = atoms;
+      bag->extres_blob = extres;
+      bag->nr_atoms = 0;
+      bag->pending = 0;
+      bag->failed = false;
+      bag->done = true;
+      bag->next = NULL;
+      if (dev->async.bags_tail)
+         dev->async.bags_tail->next = bag;
+      else
+         dev->async.bags_head = bag;
+      dev->async.bags_tail = bag;
+         seqno = bag->seqno;
+         bag = NULL;
+   }
+   {
+      unsigned inflight = 0;
+      for (struct panvk_kbase_jm_bag *bb = dev->async.bags_head;
+           bb; bb = bb->next)
+         inflight++;
+      dev->async.dbg_submits++;
+      if (inflight > dev->async.dbg_max_inflight)
+         dev->async.dbg_max_inflight = inflight;
+      if ((dev->async.dbg_submits % 300) == 0) {
+         fprintf(stderr,
+                 "PANVKDBG ovstats submits=%llu max_inflight=%u\n",
+                 (unsigned long long)dev->async.dbg_submits,
+                 dev->async.dbg_max_inflight);
+      }
+   }
+   /* Advance already-done bags synchronously: empty bags generate no JD
+    * events, so no future reap would ever retire them. */
+   struct panvk_kbase_jm_bag *retired[PANVK_KBASE_ASYNC_REAP_MAX];
+   unsigned nr_retired = 0;
+   while (dev->async.bags_head && dev->async.bags_head->done &&
+          nr_retired < ARRAY_SIZE(retired)) {
+      struct panvk_kbase_jm_bag *head = dev->async.bags_head;
+      dev->async.bags_head = head->next;
+      if (!dev->async.bags_head)
+         dev->async.bags_tail = NULL;
+      if (head->seqno > dev->async.completed_seqno)
+         dev->async.completed_seqno = head->seqno;
+       retired[nr_retired++] = head;
+    }
+    panvk_kbase_async_split_drain_locked(dev);
+    simple_mtx_unlock(&dev->async.lock);
+    panvk_kbase_async_retire_bags(retired, nr_retired);
+
+   if (bag) {
+      /* ioctl failed: release the reserved ids. */
+      simple_mtx_lock(&dev->async.lock);
+      for (unsigned i = 1; i < 256; i++) {
+         if (dev->async.atom_bag[i] == bag)
+            dev->async.atom_bag[i] = NULL;
+      }
+      simple_mtx_unlock(&dev->async.lock);
+      free(atoms);
+      free(extres);
+      free(fences);
+      free(bag);
+      return 0;
+   }
+   return seqno;
+}
+
+/* Submit a single SOFT_FENCE_TRIGGER atom chained after dep_atom (0 =
+ * none) and return the bag seqno, 0 on failure. The base_fence struct must
+ * outlive the ioctl; the kernel fills fence->fd during submit. Overlap
+ * mode only; caller holds no locks (all taken here). */
+/* Defined once (v9 TU); the JM file compiles per-arch (6/7/9). */
+#if PAN_ARCH == 9
+uint64_t
+panvk_kbase_jm_submit_trigger(struct panvk_device *dev, uint8_t dep_atom,
+                              struct kbase_base_fence *fence)
+{
+   struct base_jd_atom_v2 *atoms = calloc(1, sizeof(*atoms));
+   struct panvk_kbase_jm_bag *bag = calloc(1, sizeof(*bag));
+   if (!atoms || !bag) {
+      free(atoms);
+      free(bag);
+      return 0;
+   }
+
+   simple_mtx_lock(&dev->async.lock);
+   struct panvk_kbase_jm_bag *retired[PANVK_KBASE_ASYNC_REAP_MAX];
+   unsigned nr_retired = 0;
+   panvk_kbase_async_reap_locked(dev, retired, &nr_retired);
+   simple_mtx_unlock(&dev->async.lock);
+   panvk_kbase_async_retire_bags(retired, nr_retired);
+   simple_mtx_lock(&dev->async.lock);
+
+   uint8_t id = 0;
+   for (unsigned t = 0; t < 256 && !id; t++) {
+      uint8_t cand = dev->async.next_atom++;
+      if (dev->async.next_atom == 0)
+         dev->async.next_atom = 1;
+      if (!dev->async.atom_bag[cand])
+         id = cand;
+   }
+   if (!id) {
+      simple_mtx_unlock(&dev->async.lock);
+      free(atoms);
+      free(bag);
+      return 0;
+   }
+   if (dep_atom && !dev->async.atom_bag[dep_atom])
+      dep_atom = 0;
+
+   struct base_jd_atom_v2 *a = &atoms[0];
+   memset(a, 0, sizeof(*a));
+   a->jc = (uint64_t)(uintptr_t)fence;
+   a->atom_number = id;
+   a->core_req = KBASE_JD_REQ_SOFT_FENCE_TRIGGER;
+   if (dep_atom) {
+      a->pre_dep[0].atom_id = dep_atom;
+      a->pre_dep[0].dependency_type = 1; /* DATA */
+   }
+
+   struct kbase_ioctl_job_submit submit = {
+      .addr = (uint64_t)(uintptr_t)atoms,
+      .nr_atoms = 1,
+      .stride = sizeof(atoms[0]),
+   };
+   uint64_t seqno = 0;
+   int ret = pan_kmod_ioctl(dev->kmod.dev->fd, KBASE_IOCTL_JOB_SUBMIT,
+                            &submit);
+   if (ret) {
+      mesa_loge("kbase trigger: KBASE_IOCTL_JOB_SUBMIT failed: %s",
+                strerror(errno));
+      dev->async.lost = true;
+   } else {
+      bag->seqno = ++dev->async.seqno;
+      bag->atoms = atoms;
+      bag->extres_blob = NULL;
+      bag->fence_data = NULL;
+      bag->nr_atoms = 1;
+      bag->pending = 1;
+      bag->failed = false;
+      bag->done = false;
+      bag->next = NULL;
+      panvk_kbase_async_split_submit_locked(dev);
+      dev->async.atom_bag[id] = bag;
+      dev->async.last_atom = id;
+      if (dev->async.bags_tail)
+         dev->async.bags_tail->next = bag;
+      else
+         dev->async.bags_head = bag;
+      dev->async.bags_tail = bag;
+      seqno = bag->seqno;
+      bag = NULL;
+   }
+   simple_mtx_unlock(&dev->async.lock);
+   if (bag) {
+      simple_mtx_lock(&dev->async.lock);
+      if (dev->async.atom_bag[id] == bag)
+         dev->async.atom_bag[id] = NULL;
+      simple_mtx_unlock(&dev->async.lock);
+      free(atoms);
+      free(bag);
+      return 0;
+   }
+   return seqno;
+}
+#endif /* PAN_ARCH == 9 (single definition across the per-arch JM TUs) */
+
+static VkResult
+panvk_kbase_jm_build_async_bag(struct panvk_kbase_jm_prepared_batch *preps,
+                               unsigned nr_preps,
+                               struct base_jd_atom_v2 **atoms_out,
+                               void **extres_blob_out,
+                               unsigned *nr_atoms_out)
+{
+   struct base_jd_atom_v2 *atoms =
+      calloc(2 * nr_preps, sizeof(*atoms));
+   struct base_external_resource (*extres)[BASE_EXT_RES_COUNT_MAX] =
+      malloc(sizeof(*extres) * nr_preps);
+   if (!atoms || !extres) {
+      free(atoms);
+      free(extres);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+
+   unsigned nr_atoms = 0;
+   uint8_t prev_atom = 0;
+   /* Heap-split overlap, same as the merged path (valid within this bag). */
+   const bool overlap = panvk_overlap_enabled();
+   uint8_t half_frag[2] = { 0, 0 };
+   for (unsigned b = 0; b < nr_preps; b++) {
+      struct panvk_batch *batch = preps[b].batch;
+      memcpy(extres[b], preps[b].extres, sizeof(extres[b]));
+
+      if (batch->vtc_jc.first_job) {
+         struct base_jd_atom_v2 *a = &atoms[nr_atoms];
+         memset(a, 0, sizeof(*a));
+         a->jc = batch->vtc_jc.first_job;
+         a->atom_number = nr_atoms + 1;
+         a->core_req = preps[b].vtc_core;
+         if (prev_atom) {
+            uint8_t dep = prev_atom;
+            if (overlap && batch->frag_jc.first_job) {
+               uint8_t h = half_frag[batch->heap_half & 1];
+               if (h)
+                  dep = h;
+            }
+            a->pre_dep[0].atom_id = dep;
+            a->pre_dep[0].dependency_type = 1; /* DATA */
+         }
+         if (preps[b].nr_extres) {
+            a->extres_list = (uint64_t)(uintptr_t)&extres[b][0];
+            a->nr_extres = preps[b].nr_extres;
+            a->core_req |= BASE_JD_REQ_EXTERNAL_RESOURCES;
+         }
+         prev_atom = a->atom_number;
+         nr_atoms++;
+      }
+
+      if (batch->frag_jc.first_job) {
+         struct base_jd_atom_v2 *a = &atoms[nr_atoms];
+         memset(a, 0, sizeof(*a));
+         a->jc = batch->frag_jc.first_job;
+         a->atom_number = nr_atoms + 1;
+         a->core_req = preps[b].frag_core;
+         if (prev_atom) {
+            a->pre_dep[0].atom_id = prev_atom;
+            a->pre_dep[0].dependency_type = 1; /* DATA */
+         }
+         if (preps[b].nr_extres) {
+            a->extres_list = (uint64_t)(uintptr_t)&extres[b][0];
+            a->nr_extres = preps[b].nr_extres;
+            a->core_req |= BASE_JD_REQ_EXTERNAL_RESOURCES;
+         }
+         if (overlap)
+            half_frag[batch->heap_half & 1] = a->atom_number;
+         prev_atom = a->atom_number;
+         nr_atoms++;
+      }
+   }
+
+   *atoms_out = atoms;
+   *extres_blob_out = extres;
+   *nr_atoms_out = nr_atoms;
+   return VK_SUCCESS;
+}
+
+VkResult
+panvk_per_arch(kbase_jm_submit)(struct vk_queue *vk_queue,
+                                struct panvk_gpu_queue *queue,
+                                struct panvk_device *dev,
+                                struct vk_queue_submit *submit)
+{
+   uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT] = {};
+   uint64_t async_seqno = 0;
+   const bool want_async = panvk_kbase_async_is_enabled(dev);
+   /* Frame-split: submit-path CPU time (single-threaded benchmarks only;
+    * plain adds, no atomics). */
+   const uint64_t split_t0 = dev->async.split_on ? os_time_get_nano() : 0;
+
+   if (unlikely(getenv("PANVK_VERBOSE")))
+      fprintf(stderr, "PANVKDBG kbase submit: wait=%u signal=%u cmdbuf=%u\n",
+              submit->wait_count, submit->signal_count,
+              submit->command_buffer_count);
+   mesa_logd("panvk: kbase gpu_queue_submit start, cmd_count=%u",
+             submit->command_buffer_count);
+
+   /* On kbase there are no DRM syncobjs: resolve incoming semaphore waits on
+    * the CPU before emitting the jobs. */
+   if (submit->wait_count) {
+      VkResult result = vk_sync_wait_many(&dev->vk, submit->wait_count,
+                                          submit->waits, VK_SYNC_WAIT_COMPLETE,
+                                          UINT64_MAX);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   /* Frame-split: restart the clock after semaphore waits so submit CPU
+    * measures driver work (prep+submit), not present pacing. */
+   const uint64_t split_t1 =
+      dev->async.split_on ? os_time_get_nano() : 0;
+
+    pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+
+     if (want_async || getenv("PANVK_MERGE_SUBMIT")) {
+       /* Merged path: prepare every batch, then submit each chunk of
+        * batches as a single job bag. With PANVK_ASYNC=1 the bag is
+        * submitted without waiting (true async); with PANVK_MERGE_SUBMIT=1
+        * each bag is still waited on (fewer round trips, same ordering).
+        * Falls back to per-batch submits below. */
+       unsigned total = 0;
+       for (uint32_t j = 0; j < submit->command_buffer_count; ++j) {
+          struct panvk_cmd_buffer *cmdbuf =
+             container_of(submit->command_buffers[j], struct panvk_cmd_buffer, vk);
+          list_for_each_entry(struct panvk_batch, batch, &cmdbuf->batches, node)
+             total++;
+       }
+
+       struct panvk_kbase_jm_prepared_batch *preps =
+          malloc(sizeof(*preps) * (total ? total : 1));
+       if (!preps)
+          return vk_queue_set_lost(vk_queue, "kbase JM merge OOM");
+
+       unsigned filled = 0;
+       VkResult mres = VK_SUCCESS;
+       for (uint32_t j = 0; j < submit->command_buffer_count && mres == VK_SUCCESS; ++j) {
+          struct panvk_cmd_buffer *cmdbuf =
+             container_of(submit->command_buffers[j], struct panvk_cmd_buffer, vk);
+          list_for_each_entry(struct panvk_batch, batch, &cmdbuf->batches, node) {
+             mres = panvk_kbase_jm_prepare_batch(queue, cmdbuf, batch,
+                                                 &preps[filled]);
+             if (mres != VK_SUCCESS)
+                break;
+             filled++;
+          }
+       }
+
+       if (want_async && mres == VK_SUCCESS) {
+          /* Imported foreign fences (if any) become GPU WAIT atoms in the
+           * first overlap chunk; other paths keep their CPU waits. */
+          int *wait_fds = NULL;
+          unsigned nr_wait_fds = 0;
+          if ((dev->async.overlap || panvk_nowait_enabled()) &&
+              submit->wait_count) {
+             wait_fds = malloc(sizeof(*wait_fds) * submit->wait_count);
+             if (wait_fds) {
+                for (uint32_t w = 0; w < submit->wait_count; w++) {
+                   int fd = panvk_kbase_sync_get_import_fd(
+                      submit->waits[w].sync);
+                   if (fd >= 0)
+                      wait_fds[nr_wait_fds++] = fd;
+                }
+                if (!nr_wait_fds) {
+                   free(wait_fds);
+                   wait_fds = NULL;
+                }
+             }
+          }
+          for (unsigned off = 0; off < filled && mres == VK_SUCCESS;) {
+             unsigned n =
+                MIN2(filled - off, (unsigned)PANVK_KBASE_JM_MERGE_MAX_BATCHES);
+             if (dev->async.overlap || panvk_nowait_enabled()) {
+                /* Pipelined multi-bag submit (builds + submits under the
+                 * engine lock). With PANVK_SUBMIT_NOWAIT=1 (and overlap off)
+                 * this is the strict linear-chain variant: same machinery,
+                 * no heap-half relaxation. */
+                uint64_t seqno = panvk_kbase_jm_submit_overlap(
+                   dev, &preps[off], n, wait_fds, nr_wait_fds);
+                free(wait_fds);
+                wait_fds = NULL;
+                nr_wait_fds = 0;
+                if (!seqno) {
+                   mres = vk_queue_set_lost(
+                      vk_queue, "kbase JM overlap submission failed");
+                   break;
+                }
+                async_seqno = seqno;
+                for (unsigned b = off; b < off + n; b++) {
+                   preps[b].batch->issued = true;
+                   preps[b].cmdbuf->async_seqno = async_seqno;
+                }
+                off += n;
+                continue;
+             }
+             struct base_jd_atom_v2 *atoms = NULL;
+             void *extres_blob = NULL;
+             unsigned nr_atoms = 0;
+             mres = panvk_kbase_jm_build_async_bag(&preps[off], n, &atoms,
+                                                  &extres_blob, &nr_atoms);
+             if (mres != VK_SUCCESS)
+                break;
+             if (nr_atoms == 0) {
+                free(atoms);
+                free(extres_blob);
+                for (unsigned b = off; b < off + n; b++) {
+                   preps[b].batch->issued = true;
+                   preps[b].cmdbuf->async_seqno = async_seqno;
+                }
+                off += n;
+                continue;
+             }
+             uint64_t seqno =
+                panvk_kbase_async_submit(dev, atoms, nr_atoms,
+                                         sizeof(atoms[0]), extres_blob);
+             if (!seqno) {
+                mres = vk_queue_set_lost(vk_queue, "kbase JM async submission failed");
+                break;
+             }
+             async_seqno = seqno;
+             for (unsigned b = off; b < off + n; b++) {
+                preps[b].batch->issued = true;
+                preps[b].cmdbuf->async_seqno = seqno;
+             }
+             off += n;
+          }
+          free(wait_fds);
+       } else {
+          for (unsigned off = 0; off < filled && mres == VK_SUCCESS;) {
+             unsigned n =
+                MIN2(filled - off, (unsigned)PANVK_KBASE_JM_MERGE_MAX_BATCHES);
+             mres = panvk_kbase_jm_submit_merged(dev, vk_queue, &preps[off], n);
+             off += n;
+          }
+       }
+
+       free(preps);
+       if (mres != VK_SUCCESS)
+          return mres;
+    } else {
+       for (uint32_t j = 0; j < submit->command_buffer_count; ++j) {
+          struct panvk_cmd_buffer *cmdbuf =
+             container_of(submit->command_buffers[j], struct panvk_cmd_buffer, vk);
+
+          unsigned nb = 0;
+          list_for_each_entry(struct panvk_batch, batch, &cmdbuf->batches, node)
+             nb++;
+          if (unlikely(getenv("PANVK_VERBOSE")))
+             fprintf(stderr, "PANVKDBG kbase submit cmdbuf[%u]: batches=%u\n", j, nb);
+
+          list_for_each_entry(struct panvk_batch, batch, &cmdbuf->batches, node) {
+             VkResult result = panvk_kbase_jm_submit_batch(queue, cmdbuf, batch,
+                                                          NULL, 0, NULL, 0);
+             if (result != VK_SUCCESS)
+                return vk_queue_set_lost(vk_queue, "kbase JM submission failed");
+          }
+       }
+    }
+
+   /* Out signals: in async mode they fire when the submitted work retires;
+    * otherwise (fully synchronous submits) they are already complete. */
+   for (unsigned i = 0; i < submit->signal_count; i++) {
+      assert(submit->signals[i].signal_value == 0);
+      if (want_async && async_seqno) {
+         const uint64_t async_targets[PANVK_KBASE_SYNC_TARGET_COUNT] = {
+            async_seqno,
+            (uint64_t)(uintptr_t)dev,
+            0,
+         };
+         panvk_kbase_sync_set_pending(submit->signals[i].sync, NULL,
+                                      panvk_kbase_async_wait_bag,
+                                      async_targets);
+      } else {
+         panvk_kbase_sync_set_pending(submit->signals[i].sync, queue,
+                                      panvk_jm_kbase_wait_done, targets);
+      }
+   }
+
+   if (dev->async.split_on) {
+      dev->async.split_submit_cpu_ns += os_time_get_nano() - split_t1;
+      dev->async.split_wait_ns += split_t1 - split_t0;
+      if (++dev->async.split_submits % 300 == 0)
+         panvk_kbase_async_split_report(dev, "submit");
+   }
+
+   return VK_SUCCESS;
+}

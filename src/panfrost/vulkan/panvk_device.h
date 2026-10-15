@@ -1,0 +1,447 @@
+/*
+ * Copyright © 2021 Collabora Ltd.
+ * SPDX-License-Identifier: MIT
+ */
+
+#ifndef PANVK_DEVICE_H
+#define PANVK_DEVICE_H
+
+#include <stdint.h>
+
+#include "vk_debug_utils.h"
+#include "vk_device.h"
+#include "vk_meta.h"
+
+#include "panvk_blend.h"
+#include "panvk_instance.h"
+#include "panvk_macros.h"
+#include "panvk_mempool.h"
+#include "panvk_physical_device.h"
+#include "panvk_utrace_perfetto.h"
+
+#include "kmod/pan_kmod.h"
+#include "kmod/panthor_kmod.h"
+#ifdef HAVE_PAN_KMOD_KBASE
+#include "kmod/kbase_kmod.h"
+#endif
+#include "util/perf/u_trace.h"
+
+#include "util/simple_mtx.h"
+#include "util/u_call_once.h"
+#include "util/u_printf.h"
+#include "util/vma.h"
+
+/* On JM hardware, we need to allocate a buffer depending on vertex count.
+ *
+ * As a result, for indirect and indexed draw we allocate a large buffer with
+ * alloc on fault set.
+ *
+ * The size of that buffer is calculated assuming a max of 2 millions vertices
+ * and 18 attributes per vertex (16 user attributes, 2 specials)
+ */
+
+#define PANVK_JM_MAX_VERTICES_INDIRECT                (2000000)
+#define PANVK_JM_MAX_PER_VTX_ATTRIBUTES_INDIRECT_SIZE (18 * 4)
+
+struct panvk_precomp_cache;
+struct panvk_device_draw_context;
+
+enum panvk_queue_family {
+   PANVK_QUEUE_FAMILY_GPU,
+   PANVK_QUEUE_FAMILY_BIND,
+   PANVK_QUEUE_FAMILY_COUNT,
+};
+
+struct panvk_device {
+   struct vk_device vk;
+
+   struct {
+      simple_mtx_t lock;
+      struct util_vma_heap heap;
+      struct util_vma_heap fixed_heap;
+      struct util_vma_heap *priv_heap;
+      bool split_heap;
+      bool extended_range;
+   } as;
+
+   struct {
+      struct pan_kmod_vm *vm;
+      struct pan_kmod_dev *dev;
+      struct pan_kmod_allocator allocator;
+   } kmod;
+
+   struct panvk_priv_bo *tiler_heap;
+   struct panvk_priv_bo *poly_heap;
+   struct panvk_priv_bo *indirect_varying_buffer;
+   struct panvk_priv_bo *sample_positions;
+
+   struct {
+      struct panvk_priv_bo *handlers_bo;
+      uint32_t handler_stride;
+   } tiler_oom;
+
+   struct vk_meta_device meta;
+
+   struct {
+      struct panvk_pool rw;
+      struct panvk_pool rw_nc;
+      struct panvk_pool exec;
+   } mempools;
+
+   struct {
+      util_once_flag blackhole_once;
+      struct pan_kmod_bo *blackhole;
+   } sparse_mem;
+
+   /* For each subqueue, maximum size of the register dump region needed by
+    * exception handlers or functions */
+   uint32_t *dump_region_size;
+
+   struct vk_device_dispatch_table cmd_dispatch;
+
+   struct panvk_precomp_cache *precomp_cache;
+
+   struct {
+      struct u_trace_context utctx;
+#ifdef HAVE_PERFETTO
+      struct panvk_utrace_perfetto utp;
+#endif
+      /* Timestamp + indirect data storage */
+      struct util_vma_heap copy_buf_heap;
+      struct panvk_priv_bo *copy_buf_heap_bo;
+      simple_mtx_t copy_buf_heap_lock;
+   } utrace;
+
+   struct panvk_device_draw_context* draw_ctx;
+
+   struct {
+      struct pandecode_context *decode_ctx;
+   } debug;
+
+   struct {
+      struct u_printf_ctx ctx;
+      struct panvk_priv_bo *bo;
+   } printf;
+
+   union {
+      struct {
+         struct {
+            uint8_t count;
+            uint8_t iter_count;
+            uint16_t all_mask;
+            uint16_t all_iters_mask;
+         } sb;
+      } csf;
+   };
+
+   int drm_fd;
+
+   /* kbase JM async submission engine state (panvk_kbase_async.c).
+    * With plain PANVK_ASYNC=1, submissions are serialized per device (at
+    * most one bag in flight). With PANVK_OVERLAP=1 additionally set, bags
+    * pipeline: atoms carry globally-unique ids (0 = none) and a later bag's
+    * vertex job depends on the in-flight fragment job owning its tiler
+    * heap half. Active only on kbase with PANVK_ASYNC=1. */
+   struct {
+      simple_mtx_t lock;
+      bool init;
+      bool enabled;
+      bool lost;
+      bool overlap;
+      uint64_t seqno;
+      uint64_t completed_seqno;
+      /* The single outstanding bag (non-overlap mode), NULL when idle. */
+      struct panvk_kbase_jm_bag *bag;
+      /* Overlap mode: in-flight bags in submit order. */
+      struct panvk_kbase_jm_bag *bags_head;
+      struct panvk_kbase_jm_bag *bags_tail;
+      /* Atom id -> owning bag (ids 1..255, 0 = free). */
+      struct panvk_kbase_jm_bag *atom_bag[256];
+      uint8_t next_atom;
+      /* Last submitted frag atom per tiler heap half (0 = none/stale). */
+      uint8_t half_frag[2];
+      /* Last submitted frag atom overall (0 = none/stale): the next bag's
+       * first fragment waits for it, keeping frag work serialized across
+       * bags while vertex work overlaps. */
+      uint8_t last_frag;
+      /* Most recently submitted atom id overall (0 = none/stale). */
+      uint8_t last_atom;
+      /* Cached kbase sync-timeline fd for fence TRIGGER exports (-1 =
+       * none yet). Created on first semaphore export. */
+      int fence_stream;
+      /* Debug counters (overlap mode). */
+      uint64_t dbg_submits;
+      unsigned dbg_max_inflight;
+      /* Frame-split instrumentation (PANVK_FRAME_SPLIT=1): GPU-busy vs
+       * CPU-idle split. idle accumulates wall time with zero bags in
+       * flight; submit_cpu accumulates kbase_jm_submit CPU time. */
+      bool split_on;
+      uint64_t split_idle_ns;
+      uint64_t split_idle_since;
+      uint64_t split_wall_start;
+      uint64_t split_submit_cpu_ns;
+      uint64_t split_wait_ns;
+      uint64_t split_submits;
+   } async;
+};
+
+VK_DEFINE_HANDLE_CASTS(panvk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
+
+/* Max bags retired per reap call. Callers must size retired[] accordingly. */
+enum {
+   PANVK_KBASE_ASYNC_REAP_MAX = 32,
+};
+
+/* kbase JM async submission engine (panvk_kbase_async.c). All functions are
+ * safe to call on any KMD; they no-ops unless the device runs on kbase with
+ * PANVK_ASYNC=1. Sequence numbers identify submitted bags; 0 means none.
+ *
+ * Overlap mode (PANVK_OVERLAP=1 on top of PANVK_ASYNC=1) pipelines bags:
+ * atoms carry globally-unique ids and per-bag retirement is attributed via
+ * atom_bag[]. The single-bag `bag` field is unused in overlap mode. */
+struct panvk_kbase_jm_bag {
+   uint64_t seqno;
+   void *atoms;
+   void *extres_blob;
+   /* base_fence array for SOFT_FENCE_WAIT atoms (NULL when unused). */
+   void *fence_data;
+   unsigned nr_atoms;
+   unsigned pending;
+   bool failed;
+   bool done;
+   struct panvk_kbase_jm_bag *next;
+};
+
+void panvk_kbase_async_init(struct panvk_device *dev);
+void panvk_kbase_async_fini(struct panvk_device *dev);
+bool panvk_kbase_async_is_enabled(struct panvk_device *dev);
+
+/* Submit a bag without waiting. Takes ownership of the atoms/extres memory
+ * (freed on retirement). The caller must have ensured any previous bag
+ * completed (per-device serialization). Returns the bag sequence number,
+ * or 0 on ioctl failure (device is then marked lost). */
+uint64_t panvk_kbase_async_submit(struct panvk_device *dev, void *atoms,
+                                  unsigned nr_atoms, unsigned stride,
+                                  void *extres_blob);
+
+/* Block until the given sequence number has retired (or failed), or the
+ * absolute timeout (ns, UINT64_MAX for infinite) expires. Returns
+ * VK_SUCCESS, VK_TIMEOUT, or VK_ERROR_DEVICE_LOST. */
+VkResult panvk_kbase_async_wait_seqno(struct panvk_device *dev,
+                                      uint64_t seqno, uint64_t abs_timeout_ns);
+
+/* Block until nothing is in flight. */
+VkResult panvk_kbase_async_drain(struct panvk_device *dev);
+
+/* Consume pending JD events and retire completed bags. Lock must be held;
+ * retired bags are appended to `retired` (free with async_retire_bags). */
+void panvk_kbase_async_reap_locked(struct panvk_device *dev,
+                                   struct panvk_kbase_jm_bag **retired,
+                                   unsigned *nr_retired);
+
+/* Free retired bags (no lock needed). */
+void panvk_kbase_async_retire_bags(struct panvk_kbase_jm_bag **retired,
+                                   unsigned nr_retired);
+
+/* Oldest in-flight sequence number, 0 when idle (single-bag or list). */
+uint64_t panvk_kbase_async_head_seqno(struct panvk_device *dev);
+
+/* Submit a SOFT_FENCE_TRIGGER atom (overlap mode) chained after dep_atom.
+ * Fills fence->fd during submit; returns the bag seqno, 0 on failure.
+ * Implemented in the JM submit TU (needs atom layout). */
+struct kbase_base_fence;
+uint64_t panvk_kbase_jm_submit_trigger(struct panvk_device *dev,
+                                       uint8_t dep_atom,
+                                       struct kbase_base_fence *fence);
+
+/* True if any bag is currently in flight (nonblocking check). */
+bool panvk_kbase_async_busy(struct panvk_device *dev);
+
+/* Frame-split report (PANVK_FRAME_SPLIT=1): GPU-busy% and submit CPU.
+ * No-op unless the env knob is set. */
+void panvk_kbase_async_split_report(struct panvk_device *dev,
+                                    const char *tag);
+
+/* Frame-split transitions. Call with async.lock held: submit closes the
+ * idle window when the engine was empty; drain opens one when it empties.
+ * No-ops unless PANVK_FRAME_SPLIT=1. */
+void panvk_kbase_async_split_submit_locked(struct panvk_device *dev);
+void panvk_kbase_async_split_drain_locked(struct panvk_device *dev);
+
+/* Drain only if busy; otherwise return immediately. For free paths that must
+ * not stall when the GPU is idle. */
+static inline VkResult
+panvk_kbase_async_drain_if_busy(struct panvk_device *dev)
+{
+   if (!panvk_kbase_async_busy(dev))
+      return VK_SUCCESS;
+   return panvk_kbase_async_drain(dev);
+}
+
+/* vk_sync wait callback: targets[0] carries the sequence number to wait for.
+ * Matches panvk_kbase_sync_wait_func. */
+VkResult panvk_kbase_async_wait_bag(void *data,
+                                    const uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT],
+                                    uint64_t abs_timeout_ns);
+
+static inline struct panvk_device *
+to_panvk_device(struct vk_device *dev)
+{
+   return container_of(dev, struct panvk_device, vk);
+}
+
+/* CSF interface information, sourced from the panthor uAPI or from the
+ * kbase GLB interface depending on which backend the device came from.
+ * Always use this instead of calling panthor_kmod_get_csif_props()
+ * directly, which reads garbage on a kbase device. */
+static inline const struct drm_panthor_csif_info *
+panvk_get_csif_props(const struct panvk_device *dev)
+{
+#ifdef HAVE_PAN_KMOD_KBASE
+   const struct panvk_physical_device *phys_dev =
+      to_panvk_physical_device(dev->vk.physical);
+
+   if (phys_dev->kbase_node_path[0])
+      return kbase_kmod_get_csif_props(dev->kmod.dev);
+#endif
+
+   return panthor_kmod_get_csif_props(dev->kmod.dev);
+}
+
+/* Latest cache-flush ID, sourced from the panthor uAPI or the kbase CSF
+ * USER register page depending on which backend the device came from. */
+static inline uint32_t
+panvk_get_flush_id(const struct panvk_device *dev)
+{
+#ifdef HAVE_PAN_KMOD_KBASE
+   const struct panvk_physical_device *phys_dev =
+      to_panvk_physical_device(dev->vk.physical);
+
+   if (phys_dev->kbase_node_path[0])
+      return kbase_kmod_get_flush_id(dev->kmod.dev);
+#endif
+
+   return panthor_kmod_get_flush_id(dev->kmod.dev);
+}
+
+static inline void
+panvk_address_binding_report(struct panvk_device *dev,
+                             struct vk_object_base *object, uint64_t base,
+                             uint64_t size, VkDeviceAddressBindingTypeEXT type)
+{
+   vk_address_binding_report(dev->vk.physical->instance,
+                             object ? object : &dev->vk.base, base, size, type);
+}
+
+static inline uint32_t
+panvk_device_adjust_bo_flags(const struct panvk_device *device,
+                             uint32_t bo_flags)
+{
+   struct panvk_physical_device *pdev =
+      to_panvk_physical_device(device->vk.physical);
+
+   /* Dumping of GPU buffers messes up with CPU caches by loading buffers
+    * into cachelines which are sometimes assumed to be invalidated by the
+    * rest of the code. We could explicitly invalidate after a dump, but
+    * this is simpler to just disable cached-mappings when PANVK_DEBUG="dump".
+    * Tracing has the same fundamental issue, but we'll take care of that
+    * at the desc/CS pools level.
+    */
+   const bool allow_wb_mmap =
+      (pdev->kmod.dev->props.supported_bo_flags & PAN_KMOD_BO_FLAG_WB_MMAP) &&
+      !PANVK_DEBUG(DUMP) && !PANVK_DEBUG(NO_WB_MMAP);
+
+   if (!allow_wb_mmap)
+      bo_flags &= ~PAN_KMOD_BO_FLAG_WB_MMAP;
+
+   if (PANVK_DEBUG(DUMP) || PANVK_DEBUG(TRACE))
+      bo_flags &= ~PAN_KMOD_BO_FLAG_NO_MMAP;
+
+   if (!(device->kmod.dev->props.supported_bo_flags &
+         PAN_KMOD_BO_FLAG_GPU_UNCACHED))
+      bo_flags &= ~PAN_KMOD_BO_FLAG_GPU_UNCACHED;
+
+   return bo_flags;
+}
+
+static inline uint64_t
+panvk_get_gpu_page_size(const struct panvk_device *device)
+{
+   return (uint64_t)1 << (ffsll(device->kmod.vm->pgsize_bitmap) - 1);
+}
+
+static inline uint64_t
+panvk_as_alloc(struct panvk_device *device, struct util_vma_heap *heap,
+               uint64_t size, uint64_t alignment)
+{
+   simple_mtx_lock(&device->as.lock);
+   uint64_t address = util_vma_heap_alloc(heap, size, alignment);
+   simple_mtx_unlock(&device->as.lock);
+   return address;
+}
+
+static inline uint64_t
+panvk_as_alloc_fixed_address(struct panvk_device *device,
+                             struct util_vma_heap *heap, uint64_t address,
+                             uint64_t size)
+{
+   simple_mtx_lock(&device->as.lock);
+   bool alloc_result = util_vma_heap_alloc_addr(heap, address, size);
+   simple_mtx_unlock(&device->as.lock);
+   return alloc_result ? address : 0;
+}
+
+static inline void
+panvk_as_free(struct panvk_device *device, struct util_vma_heap *heap,
+              uint64_t address, uint64_t size)
+{
+   simple_mtx_lock(&device->as.lock);
+   util_vma_heap_free(heap, address, size);
+   simple_mtx_unlock(&device->as.lock);
+}
+
+struct nir_shader;
+
+bool panvk_nir_lower_tile_image(struct nir_shader *nir,
+                                uint32_t *color_read_out, bool *z_read_out,
+                                bool *s_read_out);
+
+struct vk_queue;
+struct vk_queue_submit;
+
+VkResult panvk_create_bind_queue(struct panvk_device *dev,
+                                 const VkDeviceQueueCreateInfo *create_info,
+                                 uint32_t queue_idx,
+                                 struct vk_queue **out_queue);
+void panvk_destroy_bind_queue(struct vk_queue *vk_queue);
+VkResult panvk_bind_queue_submit(struct vk_queue *vk_queue,
+                                 struct vk_queue_submit *vk_submit);
+VkResult panvk_bind_queue_check_status(struct vk_queue *vk_queue);
+VkResult panvk_queue_vm_bind(struct vk_queue *vk_queue,
+                             struct vk_queue_submit *vk_submit,
+                             uint32_t syncobj_handle);
+
+#if PAN_ARCH
+VkResult
+panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
+                              const VkDeviceCreateInfo *pCreateInfo,
+                              const VkAllocationCallbacks *pAllocator,
+                              VkDevice *pDevice);
+
+void panvk_per_arch(destroy_device)(struct panvk_device *device,
+                                    const VkAllocationCallbacks *pAllocator);
+
+static inline VkResult
+panvk_common_check_status(struct panvk_device *dev)
+{
+   return vk_check_printf_status(&dev->vk, &dev->printf.ctx);
+}
+
+VkResult panvk_per_arch(device_check_status)(struct vk_device *vk_dev);
+
+#if PAN_ARCH >= 10
+VkResult panvk_per_arch(init_tiler_oom)(struct panvk_device *device);
+#endif
+#endif
+
+#endif
