@@ -25,7 +25,11 @@
  * also be defined.
  */
 #if defined(__ANDROID__)
-#define DETECT_OS_ANDROID 0 /* PATCH: Termux clang targets android triple but lacks AOSP userland (liblog, libsync); forcing portable code paths */
+#if defined(__TERMUX__)
+#define DETECT_OS_ANDROID 0 /* PATCH: Termux clang targets the android triple but its userland lacks AOSP libs (liblog, libsync); force portable code paths */
+#else
+#define DETECT_OS_ANDROID 1
+#endif
 #endif
 
 #if defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
