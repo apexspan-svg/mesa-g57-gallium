@@ -63,10 +63,11 @@ jobs:
           unzip -q android-ndk-r29-linux.zip
 
       - name: Cross-build Gallium panfrost (kbase) + EGL/GLES
-        env:
-          ANDROID_NDK_HOME: /tmp/android-ndk-r29
-          CMAKE_PREFIX_PATH: ${{ env.HOME }}/spirv-translator
-        run: ./build-android-ci.sh
+        run: |
+          export ANDROID_NDK_HOME=/tmp/android-ndk-r29
+          export CMAKE_PREFIX_PATH="$HOME/spirv-translator"
+          export PKG_CONFIG_PATH="$HOME/spirv-translator/lib/pkgconfig"
+          ./build-android-ci.sh
 
       - name: Upload driver zip
         uses: actions/upload-artifact@v4
