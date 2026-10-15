@@ -43,7 +43,7 @@ if [ ! -f "$HOSTB/build.ninja" ]; then
       -Dopengl=false -Dgles1=disabled -Dgles2=disabled -Degl=disabled -Dglx=disabled -Dgbm=disabled \
       -Dtools= -Dvideo-codecs= \
       -Dpanfrost-kmds=kbase,panthor \
-      -Dallow-fallback-for=libdrm --force-fallback-for=libdrm,expat,zlib \
+      -Dallow-fallback-for=libdrm  \
       -Dlibdrm:default_library=static
 fi
 ninja -C "$HOSTB" src/compiler/clc/mesa_clc src/compiler/spirv/vtn_bindgen2 \
@@ -89,7 +89,7 @@ if [ ! -f "$BUILD/build.ninja" ]; then
       -Dmesa-clc=system -Dprecomp-compiler=system \
       -Dpanfrost-kmds=kbase,panthor \
       -Dllvm=disabled -Dzstd=disabled -Dlmsensors=disabled -Dperfetto=false \
-      -Dallow-fallback-for=libdrm,perfetto --force-fallback-for=expat,libdrm,zlib \
+      -Dallow-fallback-for=libdrm,perfetto  \
       -Dlibdrm:default_library=static -Dexpat:default_library=static -Dzlib:default_library=static
 fi
 
