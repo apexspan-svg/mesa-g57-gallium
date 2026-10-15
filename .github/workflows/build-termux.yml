@@ -19,7 +19,7 @@ jobs:
       - name: Build inside Termux container
         run: |
           docker pull termux/termux-docker:aarch64
-          docker run --rm -v "${{ github.workspace }}:/repo" \
+          docker run --rm --user root -v "${{ github.workspace }}:/repo" \
             termux/termux-docker:aarch64 bash -c '
             set -ex
             pkg update -y
