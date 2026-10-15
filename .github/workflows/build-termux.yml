@@ -27,11 +27,12 @@ jobs:
           curl -sL -o bootstrap.zip \
             "https://github.com/termux/termux-packages/releases/download/${BOOTSTRAP_TAG}/bootstrap-aarch64.zip"
           mkdir -p "$TROOT" && unzip -q bootstrap.zip -d "$TROOT"
-          # Recreate packaged symlinks (SYMLINKS.txt format: target<-link).
+          # Recreate packaged symlinks (SYMLINKS.txt format: target<-link,
+          # where "<-" is U+2190 LEFTWARDS ARROW, not ASCII "<-").
           cd "$TROOT"
           while IFS= read -r line; do
-            target="${line%%<-*}"; link="${line##*<-}"
-            ln -sfn "$target" ".$link"
+            target="${line%%←*}"; link="${line##*←}"
+            ln -sfn "$target" "$link"
           done < SYMLINKS.txt
           # Make the canonical $PREFIX path resolve inside proot.
           mkdir -p data/data/com.termux/files
