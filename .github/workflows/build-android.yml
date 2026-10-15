@@ -30,23 +30,42 @@ jobs:
           sudo pip3 install -U --break-system-packages meson
           meson --version
 
+      - name: Cache SPIRV translator install
+        id: cache-spirv
+        uses: actions/cache@v4
+        with:
+          path: ~/spirv-translator
+          key: spirv-translator-21.1.9-llvm21
+
       - name: Build SPIRV-LLVM-Translator 21.1 (not packaged for noble)
+        if: steps.cache-spirv.outputs.cache-hit != 'true'
         run: |
           cd /tmp
           git clone --depth 1 --branch v21.1.9 https://github.com/KhronosGroup/SPIRV-LLVM-Translator.git
           cmake -S SPIRV-LLVM-Translator -B spirv-build \
-            -DCMAKE_BUILD_TYPE=Release -DLLVM_DIR=/usr/lib/llvm-21/cmake
+            -DCMAKE_BUILD_TYPE=Release -DLLVM_DIR=/usr/lib/llvm-21/cmake \
+            -DCMAKE_INSTALL_PREFIX="$HOME/spirv-translator"
           cmake --build spirv-build -j"$(nproc)"
-          sudo cmake --install spirv-build
+          cmake --install spirv-build
+
+      - name: Cache Android NDK r29
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: /tmp/android-ndk-r29
+          key: android-ndk-r29
 
       - name: Install Android NDK r29
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
         run: |
           cd /tmp
           wget -q https://dl.google.com/android/repository/android-ndk-r29-linux.zip
           unzip -q android-ndk-r29-linux.zip
-          echo "ANDROID_NDK_HOME=/tmp/android-ndk-r29" >> "$GITHUB_ENV"
 
       - name: Cross-build Gallium panfrost (kbase) + EGL/GLES
+        env:
+          ANDROID_NDK_HOME: /tmp/android-ndk-r29
+          CMAKE_PREFIX_PATH: ${{ env.HOME }}/spirv-translator
         run: ./build-android-ci.sh
 
       - name: Upload driver zip
