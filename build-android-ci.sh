@@ -81,7 +81,7 @@ EOF
 if [ ! -f "$BUILD/build.ninja" ]; then
    meson setup "$BUILD" --cross-file "$BUILD/cross.ini" \
       -Dbuildtype=debugoptimized -Db_ndebug=true \
-      -Dplatforms=android -Dplatform-sdk-version=31 -Dandroid-stub=true -Dandroid-strict=false \
+      -Dplatforms=android,surfaceless -Dplatform-sdk-version=31 -Dandroid-stub=true -Dandroid-strict=false \
       -Dandroid-libbacktrace=disabled \
       -Dgallium-drivers=panfrost -Dvulkan-drivers= -Dvulkan-layers= -Dtools= -Dvideo-codecs= \
       -Degl=enabled -Dopengl=true -Dgles1=disabled -Dgles2=enabled -Dglx=disabled -Dgbm=disabled \
