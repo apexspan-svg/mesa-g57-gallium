@@ -34,8 +34,8 @@ main(void)
       return 1;
    }
 
-   PFNEGLGETPLATFORMDISPLAYEXTPROC eglGetPlatformDisplayEXT =
-      (PFNEGLGETPLATFORMDISPLAYEXTPROC)dlsym(egl, "eglGetPlatformDisplayEXT");
+   EGLDisplay (*eglGetPlatformDisplay)(EGLenum, void *, const EGLint *) =
+      (EGLDisplay(*)(EGLenum, void *, const EGLint *))dlsym(egl, "eglGetPlatformDisplay");
    EGLDisplay (*eglGetDisplay)(EGLNativeDisplayType) =
       (EGLDisplay(*)(EGLNativeDisplayType))dlsym(egl, "eglGetDisplay");
    EGLBoolean (*eglInitialize)(EGLDisplay, EGLint *, EGLint *) =
@@ -63,9 +63,11 @@ main(void)
    }
 
    EGLDisplay dpy = EGL_NO_DISPLAY;
-   if (eglGetPlatformDisplayEXT)
-      dpy = eglGetPlatformDisplayEXT(EGL_PLATFORM_SURFACELESS_MESA,
-                                     EGL_DEFAULT_DISPLAY, NULL);
+   if (eglGetPlatformDisplay) {
+      printf("using surfaceless platform display\n");
+      dpy = eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA,
+                                  EGL_DEFAULT_DISPLAY, NULL);
+   }
    if (dpy == EGL_NO_DISPLAY && eglGetDisplay)
       dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
    if (dpy == EGL_NO_DISPLAY) {
