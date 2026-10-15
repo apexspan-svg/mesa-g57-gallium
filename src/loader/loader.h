@@ -65,6 +65,9 @@ loader_get_pci_id_for_fd(int fd, int *vendor_id, int *chip_id);
 char *
 loader_get_driver_for_fd(int fd);
 
+bool
+loader_fd_is_kbase(int fd);
+
 void *
 loader_open_driver_lib(const char *driver_name,
                        const char *lib_suffix,

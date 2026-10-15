@@ -220,6 +220,57 @@ static const __DRIextension *kopper_loader_extensions[] = {
    &image_lookup_extension.base, NULL,
 };
 
+/* MESA_KBASE_NODE: bring up a screen on a node that is NOT a DRM device.
+ *
+ * The normal probe walks libdrm's device list, so it can only ever find
+ * /dev/dri/*. A Mali on Arm's stock kbase driver has no DRM node at all --
+ * the GPU is /dev/mali0 -- and gallium panfrost drives it through its kbase
+ * backend once something hands it the fd. This does exactly that: open the
+ * node, resolve the driver name (MESA_LOADER_DRIVER_OVERRIDE=panfrost also
+ * works, since the fd will not answer a DRM version ioctl meaningfully),
+ * and create the screen. Diagnostic path, gated on an environment variable.
+ * (Ported from JimVulkan/mali-panfrost.) */
+static bool
+surfaceless_probe_kbase_node(_EGLDisplay *disp)
+{
+   struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
+   const char *node = getenv("MESA_KBASE_NODE");
+
+   if (!node)
+      return false;
+
+   dri2_dpy->fd_render_gpu = loader_open_device(node);
+   if (dri2_dpy->fd_render_gpu < 0) {
+      _eglLog(_EGL_WARNING, "surfaceless: cannot open %s", node);
+      return false;
+   }
+   dri2_dpy->fd_display_gpu = dri2_dpy->fd_render_gpu;
+
+   dri2_dpy->driver_name = loader_get_driver_for_fd(dri2_dpy->fd_render_gpu);
+   if (!dri2_dpy->driver_name) {
+      _eglLog(_EGL_WARNING,
+              "surfaceless: no driver for %s (set MESA_LOADER_DRIVER_OVERRIDE)", node);
+      close(dri2_dpy->fd_render_gpu);
+      dri2_dpy->fd_render_gpu = -1;
+      return false;
+   }
+
+   dri2_dpy->loader_extensions = image_loader_extensions;
+
+   if (!dri2_create_screen(disp)) {
+      _eglLog(_EGL_WARNING, "surfaceless: failed to create a %s screen on %s",
+              dri2_dpy->driver_name, node);
+      free(dri2_dpy->driver_name);
+      dri2_dpy->driver_name = NULL;
+      close(dri2_dpy->fd_render_gpu);
+      dri2_dpy->fd_render_gpu = -1;
+      return false;
+   }
+
+   _eglLog(_EGL_INFO, "surfaceless: %s screen up on %s", dri2_dpy->driver_name, node);
+   return true;
+}
+
 static bool
 surfaceless_probe_device(_EGLDisplay *disp, bool swrast, bool zink)
 {
@@ -227,6 +278,9 @@ surfaceless_probe_device(_EGLDisplay *disp, bool swrast, bool zink)
    struct dri2_egl_display *dri2_dpy = dri2_egl_display(disp);
    _EGLDevice *dev_list = _eglGlobal.DeviceList;
    drmDevicePtr device;
+
+   if (!swrast && !zink && surfaceless_probe_kbase_node(disp))
+      return true;
 
    while (dev_list) {
       if (!_eglDeviceSupports(dev_list, _EGL_DEVICE_DRM))

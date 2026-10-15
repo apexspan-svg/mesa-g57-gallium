@@ -791,6 +791,12 @@ loader_get_driver_for_fd(int fd)
          return strdup(override);
    }
 
+   /* Arm's kbase node (/dev/mali0) is not a DRM device: drmGetVersion on it
+    * fails on some kernels and returns garbage on others. Gallium panfrost
+    * drives it through its kbase backend. (Ported from JimVulkan/mali-panfrost.) */
+   if (loader_fd_is_kbase(fd))
+      return strdup("panfrost");
+
 #if defined(USE_DRICONF)
    driver = loader_get_dri_config_driver(fd);
    if (driver)
@@ -808,6 +814,21 @@ void
 loader_set_logger(loader_logger *logger)
 {
    log_ = logger;
+}
+
+/* True when fd refers to Arm's kbase kernel node (/dev/mali*) rather than a
+ * DRM device. Resolved through /proc/self/fd so no device database is
+ * needed. (Ported from JimVulkan/mali-panfrost.) */
+bool
+loader_fd_is_kbase(int fd)
+{
+   char link[64], path[PATH_MAX];
+   snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+   const ssize_t n = readlink(link, path, sizeof(path) - 1);
+   if (n <= 0)
+      return false;
+   path[n] = 0;
+   return strncmp(path, "/dev/mali", 9) == 0;
 }
 
 bool
