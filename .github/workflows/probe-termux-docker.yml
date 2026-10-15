@@ -1,0 +1,16 @@
+name: probe-termux-docker
+
+# One-off experiment: can the official Termux docker image execute on the
+# arm64 runner (i.e. is the bionic loader problem solved inside it)?
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Pull and run Termux image
+        run: |
+          docker pull termux/termux-docker:aarch64
+          docker run --rm termux/termux-docker:aarch64 \
+            bash -c 'echo PROBE-START; ls /system/bin/linker64 2>&1; echo hello-from-termux-docker; pkg --version 2>&1 | head -1'
