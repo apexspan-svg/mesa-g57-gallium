@@ -61,6 +61,8 @@ panfrost_open_device(void *memctx, int fd, struct panfrost_device *dev)
    dev->arch = pan_arch(dev->kmod.dev->props.gpu_id);
    dev->model = pan_get_model(dev->kmod.dev->props.gpu_id,
                               dev->kmod.dev->props.gpu_variant);
+   fprintf(stderr, "TMPDBG open_device arch=%u model=%p\n", dev->arch,
+           (void *)dev->model);
 
    /* If we don't recognize the model, bail early */
    if (!dev->model)
@@ -77,6 +79,7 @@ panfrost_open_device(void *memctx, int fd, struct panfrost_device *dev)
    dev->kmod.vm = pan_kmod_vm_create(
       dev->kmod.dev, PAN_KMOD_VM_FLAG_AUTO_VA | PAN_KMOD_VM_FLAG_TRACK_ACTIVITY,
       user_va_start, user_va_end - user_va_start);
+   fprintf(stderr, "TMPDBG open_device vm=%p\n", (void *)dev->kmod.vm);
    if (!dev->kmod.vm)
       goto err_free_kmod_dev;
 
@@ -204,6 +207,8 @@ panfrost_open_device_kbase(void *memctx, const char *path,
    dev->arch = pan_arch(dev->kmod.dev->props.gpu_id);
    dev->model = pan_get_model(dev->kmod.dev->props.gpu_id,
                               dev->kmod.dev->props.gpu_variant);
+   fprintf(stderr, "TMPDBG open_device arch=%u model=%p\n", dev->arch,
+           (void *)dev->model);
 
    if (!dev->model) {
       mesa_loge("panfrost: unrecognised GPU ID 0x%"PRIx64,
@@ -219,6 +224,7 @@ panfrost_open_device_kbase(void *memctx, const char *path,
    dev->kmod.vm = pan_kmod_vm_create(
       dev->kmod.dev, PAN_KMOD_VM_FLAG_AUTO_VA | PAN_KMOD_VM_FLAG_TRACK_ACTIVITY,
       user_va_start, user_va_end - user_va_start);
+   fprintf(stderr, "TMPDBG open_device vm=%p\n", (void *)dev->kmod.vm);
    if (!dev->kmod.vm)
       goto err_free_kmod_dev;
 
