@@ -22,6 +22,11 @@
 - Varying (textured) draws are the next untested v9 path: our PASS covers
   clear + flat-shaded triangle only.
 
+## kbase version notes
+- Atom stride is kernel-version dependent (BossDrk, G52/r49: 56 bytes vs
+  the usual 64). Our submit defaults to 64 (proven on JM 11.38) with
+  `PAN_KBASE_ATOM_STRIDE=56|64|72` override; FristOneRR auto-detects.
+
 ## Sources
 - HapplyCardo/mesa-Panfork-android `bifrost-g57` (`d8cb29f9`, `4c42d497`):
   G57 bring-up on Dimensity 820, glmark2 + glxgears ~287 FPS.
