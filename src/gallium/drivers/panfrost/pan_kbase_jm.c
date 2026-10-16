@@ -31,6 +31,7 @@
 
 #include <errno.h>
 #include <poll.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -94,6 +95,48 @@ struct base_jd_atom_v2 {
    uint32_t core_req;
    uint8_t payload[16];
 } __attribute__((packed, aligned(16)));
+
+/* Submit statistics (PAN_KBASE_STATS=1): batches submitted, atoms, and
+ * total microseconds spent blocked in submit+wait. Printed to stderr at
+ * every 512th batch and on the first error. */
+struct kbase_submit_stats {
+   uint64_t batches;
+   uint64_t atoms;
+   uint64_t wait_us;
+};
+
+static struct kbase_submit_stats submit_stats;
+static pthread_mutex_t stats_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static bool
+stats_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = getenv("PAN_KBASE_STATS") != NULL;
+   return enabled;
+}
+
+static void
+stats_add(unsigned atoms, uint64_t wait_ns)
+{
+   if (!stats_enabled())
+      return;
+   pthread_mutex_lock(&stats_mutex);
+   submit_stats.batches++;
+   submit_stats.atoms += atoms;
+   submit_stats.wait_us += wait_ns / 1000;
+   if ((submit_stats.batches & 511) == 0) {
+      fprintf(stderr,
+              "panfrost/kbase stats: %llu batches, %llu atoms, "
+              "%llu us blocked (avg %.1f us/batch)\n",
+              (unsigned long long)submit_stats.batches,
+              (unsigned long long)submit_stats.atoms,
+              (unsigned long long)submit_stats.wait_us,
+              (double)submit_stats.wait_us / (double)submit_stats.batches);
+   }
+   pthread_mutex_unlock(&stats_mutex);
+}
 
 /* One submit+wait at a time per process: with the mutex held, no two
  * threads can interleave atoms, so event matching is unambiguous and batch
@@ -223,7 +266,9 @@ pan_kbase_jm_submit_jc(struct panfrost_device *dev, uint64_t first_job_desc,
       return err;
    }
 
+   int64_t t0 = os_time_get_nano();
    ret = wait_atom(dev->kmod.dev->fd, atom.atom_number, 60 * 1000000000ll);
+   stats_add(1, os_time_get_nano() - t0);
    pthread_mutex_unlock(&submit_mutex);
    return ret;
 }
@@ -282,11 +327,13 @@ pan_kbase_jm_submit_batch(struct panfrost_device *dev, uint64_t vtc_jc,
 
    /* Either atom failing fails the batch; wait for both (vtc first, since
     * frag cannot complete before it). */
+   int64_t t0 = os_time_get_nano();
    ret = wait_atom(dev->kmod.dev->fd, atoms[0].atom_number,
                    60 * 1000000000ll);
    if (!ret)
       ret = wait_atom(dev->kmod.dev->fd, atoms[1].atom_number,
                       60 * 1000000000ll);
+   stats_add(2, os_time_get_nano() - t0);
    pthread_mutex_unlock(&submit_mutex);
    return ret;
 }
