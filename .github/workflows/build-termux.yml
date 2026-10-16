@@ -74,6 +74,8 @@ jobs:
 
       - name: Build + stage install
         run: |
+          id; ls -ld /repo /github/workspace 2>/dev/null || true
+          mkdir -p stage/data/data/com.termux/files/usr/lib
           /entrypoint.sh ninja -C build-termux
           /entrypoint.sh env DESTDIR=/repo/stage ninja -C build-termux install
 
