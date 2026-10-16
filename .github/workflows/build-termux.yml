@@ -79,7 +79,7 @@ jobs:
 
       - name: Package Termux drop-in
         run: |
-          cd /tmp/stage/data/data/com.termux/files/usr
+          cd "$GITHUB_WORKSPACE/stage/data/data/com.termux/files/usr"
           tar -czf "$GITHUB_WORKSPACE/panfrost-g57-termux.tar.gz" lib/
 
       - name: Upload Termux package
