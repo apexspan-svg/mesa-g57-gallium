@@ -122,8 +122,20 @@ panfrost_open_device(void *memctx, int fd, struct panfrost_device *dev)
     */
 
    if (dev->arch < 10) {
+      /* Tiler heap size in MB (cf. PanVK PANVK_TILER_HEAP_MB). Default
+       * matches upstream; tune down on memory-constrained devices. */
+      long tiler_mb = 128;
+      {
+         const char *e = getenv("PAN_TILER_HEAP_MB");
+         if (e && e[0]) {
+            long v = strtol(e, NULL, 0);
+            if (v >= 16 && v <= 2048)
+               tiler_mb = v;
+         }
+      }
       dev->tiler_heap = panfrost_bo_create(
-         dev, 128 * 1024 * 1024, PAN_BO_INVISIBLE | PAN_BO_GROWABLE, "Tiler heap");
+         dev, (size_t)tiler_mb * 1024 * 1024,
+         PAN_BO_INVISIBLE | PAN_BO_GROWABLE, "Tiler heap");
       if (!dev->tiler_heap) {
          mesa_loge("panfrost: failed to allocate tiler heap");
          goto err_free_kmod_dev;

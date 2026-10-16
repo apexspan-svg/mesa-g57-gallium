@@ -8,8 +8,7 @@
  */
 
 #include "pan_shader.h"
-#include "nir/tgsi_to_nir.h"
-#include "util/u_memory.h"
+#include "nir/tgsi_to_nir.h"#include "util/u_memory.h"
 #include "util/u_prim.h"
 #include "nir_builder.h"
 #include "nir_serialize.h"
@@ -19,7 +18,10 @@
 #include "pan_nir.h"
 #include "pan_trace.h"
 #include "compiler/bifrost/bifrost_compile.h"
+#include "compiler/bifrost/bi_debug.h"
 #include "shader_enums.h"
+
+#include <stdlib.h>
 
 static struct panfrost_uncompiled_shader *
 panfrost_alloc_shader(const nir_shader *nir)
@@ -217,7 +219,41 @@ panfrost_shader_compile(struct panfrost_screen *screen, const nir_shader *ir,
    }
 
    out->binary = UTIL_DYNARRAY_INIT;
+   struct pan_compile_inputs inputs_saved = inputs;
    screen->vtbl.compile_shader(s, &inputs, &out->binary, &out->info);
+
+   /* SPILL retry (cf. PanVK SPILL_NOOPT, default on): shaders whose first
+    * compile spills registers can hang the GPU once backend optimisations
+    * run, so recompile those with optimisations off. Env PAN_SPILL_NOOPT=0
+    * disables. */
+   {
+      static int spill_noopt = -1;
+      if (spill_noopt < 0) {
+         const char *e = getenv("PAN_SPILL_NOOPT");
+         spill_noopt = !(e && e[0] == '0');
+      }
+      if (spill_noopt && out->info.tls_size) {
+         /* compile_shader consumes its NIR input, so retry on a clone and
+          * only keep the result if it produced a binary. */
+         nir_shader *retry = nir_shader_clone(NULL, s);
+         if (retry) {
+            struct util_dynarray binary2 = UTIL_DYNARRAY_INIT;
+            struct pan_shader_info info2 = out->info;
+            struct pan_compile_inputs inputs2 = inputs_saved;
+            bi_force_noopt = 1;
+            screen->vtbl.compile_shader(retry, &inputs2, &binary2, &info2);
+            bi_force_noopt = 0;
+            ralloc_free(retry);
+            if (binary2.size > 0) {
+               util_dynarray_fini(&out->binary);
+               out->binary = binary2;
+               out->info = info2;
+            } else {
+               util_dynarray_fini(&binary2);
+            }
+         }
+      }
+   }
 
    /* Report stats only if we really got the shader compiled */
    if (out->binary.size > 0) {
