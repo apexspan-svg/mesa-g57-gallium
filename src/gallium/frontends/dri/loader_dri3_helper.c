@@ -1659,8 +1659,9 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
    pixmap = xcb_generate_id(draw->conn);
 
    xcb_void_cookie_t cookie_pix, cookie_fence;
-   if (draw->multiplanes_available &&
-       buffer->modifier != DRM_FORMAT_MOD_INVALID) {
+   bool tried_plural = draw->multiplanes_available &&
+                       buffer->modifier != DRM_FORMAT_MOD_INVALID;
+   if (tried_plural) {
       cookie_pix = xcb_dri3_pixmap_from_buffers_checked(draw->conn,
                                                         pixmap,
                                                         draw->window,
@@ -1689,9 +1690,29 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
                                                  fence_fd);
    /* Group error checking to limit round-trips. The raw-FD path has no
     * DRI3 explicit sync on the server (cf. PanVK); the driver already
-    * waited for GPU completion, so skip the fence import there. */
-   if (!check_xcb_error(cookie_pix, "xcb_dri3_pixmap_from_buffer[s]"))
-      goto no_buffer_attrib;
+    * waited for GPU completion, so skip the fence import there.
+    * If the modifier-carrying plural request is rejected (some servers
+    * advertise DRI3 1.2 without implementing it), retry as plain
+    * PixmapFromBuffer on the same dma-buf before giving up. */
+   if (!check_xcb_error(cookie_pix, "xcb_dri3_pixmap_from_buffer[s]")) {
+      if (!tried_plural)
+         goto no_buffer_attrib;
+      fprintf(stderr, "TMPDBG dri3 plural rejected, retrying plain\n");
+      pixmap = xcb_generate_id(draw->conn);
+      cookie_pix = xcb_dri3_pixmap_from_buffer_checked(
+         draw->conn, pixmap, draw->drawable, 0,
+         width, height, buffer->strides[0],
+         depth, buffer->cpp * 8, buffer_fds[0]);
+      if (!check_xcb_error(cookie_pix, "xcb_dri3_pixmap_from_buffer"))
+         goto no_buffer_attrib;
+      /* The fence below was registered against the failed pixmap; redo it
+       * against the new one. The old fence id is simply abandoned. */
+      cookie_fence = xcb_dri3_fence_from_fd_checked(draw->conn,
+                                                    pixmap,
+                                                    (sync_fence = xcb_generate_id(draw->conn)),
+                                                    false,
+                                                    fence_fd);
+   }
    if (!use_raw_fd && !check_xcb_error(cookie_fence, "xcb_dri3_fence_from_fd"))
       goto no_buffer_attrib;
 
