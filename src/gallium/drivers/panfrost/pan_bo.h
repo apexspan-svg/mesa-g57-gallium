@@ -38,6 +38,13 @@
  * PAN_BO_SHARED if the BO has not been exported yet */
 #define PAN_BO_SHAREABLE (1 << 5)
 
+/* BO is allocated dma-buf-exportable from birth (kbase: dma-heap or
+ * AHardwareBuffer instead of native MEM_ALLOC, which can never be
+ * exported). Implies SHAREABLE semantics; bypasses nothing in the cache
+ * (flags mismatch keeps kinds separate), but prefer it only for shared
+ * resources: exportable backing may be slower or scarcer. */
+#define PAN_BO_EXPORTABLE (1 << 6)
+
 /* GPU access flags */
 
 /* BO is either shared (can be accessed by more than one GPU batch) or private

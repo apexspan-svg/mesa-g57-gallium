@@ -26,15 +26,17 @@
 #include "util/streaming-load-memcpy.h"
 
 #include "decode.h"
-#include "pan_afbc.h"
-#include "pan_afrc.h"
+#include "pan_afbc.h"#include "pan_afrc.h"
 #include "pan_blitter.h"
 #include "pan_bo.h"
 #include "pan_context.h"
-#include "pan_resource.h"
-#include "pan_screen.h"
+#include "pan_resource.h"#include "pan_screen.h"
 #include "pan_tiling.h"
 #include "pan_trace.h"
+
+#ifdef HAVE_PAN_KMOD_KBASE
+#include "pan_kbase_jm.h"
+#endif
 #include "pan_util.h"
 
 static uint64_t
@@ -1049,7 +1051,22 @@ panfrost_resource_create_with_modifier(struct pipe_screen *screen,
       so->modifier_constant = true;
    }
 
+#ifdef HAVE_PAN_KMOD_KBASE
+   /* Raw-FD present (Termux:X11/Winlator marker 1274): linear layout in
+    * an exportable BO so the buffer can cross to the X server as a
+    * dma-buf fd. Layout LINEAR, reported modifier stays 1274. */
+   bool kbase_raw_fd = (modifier == PAN_KBASE_RAW_FD_MODIFIER) &&
+                       pan_kbase_jm_is_kbase(dev);
+   if (kbase_raw_fd)
+      modifier = DRM_FORMAT_MOD_LINEAR;
+#endif
+
    panfrost_resource_setup(screen, so, modifier, template->format, plane_idx);
+
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (kbase_raw_fd)
+      so->modifier = PAN_KBASE_RAW_FD_MODIFIER;
+#endif
 
    if (dev->ro && (template->bind & PIPE_BIND_SCANOUT)) {
       struct winsys_handle handle;
@@ -1119,6 +1136,11 @@ panfrost_resource_create_with_modifier(struct pipe_screen *screen,
       if (template->bind & PIPE_BIND_SHARED)
          flags |= PAN_BO_SHAREABLE;
 
+#ifdef HAVE_PAN_KMOD_KBASE
+      if (kbase_raw_fd)
+         flags |= PAN_BO_EXPORTABLE;
+#endif
+
       char *res_label =
          panfrost_resource_new_label(so, so->image.props.modifier , NULL);
 
@@ -1172,6 +1194,16 @@ panfrost_resource_create_with_modifiers(struct pipe_screen *screen,
 {
    PANFROST_EMULATED_MODIFIERS(emulated_mods);
    PAN_SUPPORTED_MODIFIERS(native_mods);
+
+#ifdef HAVE_PAN_KMOD_KBASE
+   /* Raw-FD present goes through the explicit-modifier path too. */
+   if (pan_kbase_jm_is_kbase(pan_device(screen)) &&
+       drm_find_modifier(PAN_KBASE_RAW_FD_MODIFIER, modifiers, count)) {
+      return panfrost_resource_create_with_modifier(screen, template,
+                                                    PAN_KBASE_RAW_FD_MODIFIER,
+                                                    0);
+   }
+#endif
 
    for (unsigned i = 0; i < ARRAY_SIZE(native_mods); ++i) {
       if (drm_find_modifier(native_mods[i], modifiers, count)) {

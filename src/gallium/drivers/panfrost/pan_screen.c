@@ -31,6 +31,10 @@
 #include "pan_afrc.h"
 #include "pan_bo.h"
 #include "pan_fence.h"
+
+#ifdef HAVE_PAN_KMOD_KBASE
+#include "pan_kbase_jm.h"
+#endif
 #include "pan_public.h"
 #include "pan_resource.h"
 #include "pan_screen.h"
@@ -486,6 +490,28 @@ panfrost_walk_dmabuf_modifiers(struct pipe_screen *screen,
       }
       count++;
    }
+
+#ifdef HAVE_PAN_KMOD_KBASE
+   /* Raw-FD present marker for Termux:X11/Winlator: single-plane formats
+    * that also admit LINEAR get an exportable linear twin. External-only:
+    * only meaningful across processes (present). */
+   if (pan_kbase_jm_is_kbase(dev) && !is_yuv &&
+       util_format_get_num_planes(format) == 1 &&
+       (test_modifier == DRM_FORMAT_MOD_INVALID ||
+        test_modifier == PAN_KBASE_RAW_FD_MODIFIER)) {
+      bool linear_ok = false;
+      for (unsigned i = 0; i < (unsigned)count && !linear_ok; ++i)
+         linear_ok = (modifiers[i] == DRM_FORMAT_MOD_LINEAR);
+      if (linear_ok && max > (int)count) {
+         modifiers[count] = PAN_KBASE_RAW_FD_MODIFIER;
+         if (external_only)
+            external_only[count] = true;
+         count++;
+      } else if (linear_ok) {
+         count++;
+      }
+   }
+#endif
 
    *out_count = count;
 }

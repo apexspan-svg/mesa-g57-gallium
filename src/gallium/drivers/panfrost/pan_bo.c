@@ -15,6 +15,11 @@
 #include "pan_util.h"
 #include "wrap.h"
 
+#ifdef HAVE_PAN_KMOD_KBASE
+#include "kmod/kbase_kmod.h"
+#include "pan_kbase_jm.h"
+#endif
+
 #include "util/os_mman.h"
 
 #include "util/u_inlines.h"
@@ -59,8 +64,16 @@ panfrost_bo_alloc(struct panfrost_device *dev, size_t size, uint32_t flags,
    struct pan_kmod_bo *kmod_bo;
    struct panfrost_bo *bo;
 
-   kmod_bo = pan_kmod_bo_alloc(dev->kmod.dev, exclusive_vm, size,
-                               to_kmod_bo_flags(flags));
+#ifdef HAVE_PAN_KMOD_KBASE
+   /* Exportable resources need dma-buf-capable backing from birth: native
+    * kbase MEM_ALLOC BOs have no dma-buf and can never be exported. */
+   if ((flags & PAN_BO_EXPORTABLE) && pan_kbase_jm_is_kbase(dev)) {
+      kmod_bo = kbase_kmod_bo_alloc_exportable(dev->kmod.dev, size,
+                                               to_kmod_bo_flags(flags));
+   } else
+#endif
+      kmod_bo = pan_kmod_bo_alloc(dev->kmod.dev, exclusive_vm, size,
+                                  to_kmod_bo_flags(flags));
 
    if (kmod_bo == NULL)
       goto err_alloc;

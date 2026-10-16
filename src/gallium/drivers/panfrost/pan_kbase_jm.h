@@ -34,3 +34,9 @@ int pan_kbase_jm_submit_jc(struct panfrost_device *dev, uint64_t first_job_desc,
 int pan_kbase_jm_submit_batch(struct panfrost_device *dev, uint64_t vtc_jc,
                               uint64_t frag_jc, uint32_t vtc_reqs,
                               uint32_t frag_reqs);
+
+/* Raw-FD present modifier: Termux:X11 and Winlator X servers use 1274 as a
+ * private marker for a directly mmap-able raw dma-buf FD. Deliberately not
+ * a real DRM format modifier. Resources created with it are linear and
+ * allocated exportable. (Protocol from PanVK AHB WSI.) */
+#define PAN_KBASE_RAW_FD_MODIFIER 1274ull
