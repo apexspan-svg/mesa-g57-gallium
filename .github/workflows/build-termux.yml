@@ -18,10 +18,11 @@ jobs:
 
       - name: Build inside Termux container
         run: |
-          docker pull termux/termux-docker:aarch64
-          docker run --rm --user "$(id -u):$(id -g)" -v "${{ github.workspace }}:/repo" \
+          docker pull termux/termux-docker:aarch64@sha256:d9e15c9751ed0e5d436ca32fbf02b670cc004df4b01b7bfd8d145a84ba0575
+          chmod -R a+rwX "${{ github.workspace }}"
+          docker run --rm --user root -v "${{ github.workspace }}:/repo" \
             --entrypoint /data/data/com.termux/files/usr/bin/bash \
-            termux/termux-docker:aarch64 -c '
+            termux/termux-docker:aarch64@sha256:d9e15c9751ed0e5d436ca32fbf02b670cc004df4b01b7bfd8d145a84ba0575 -c '
             set -ex
             pkg update -y
             pkg install -y python clang bison flex pkg-config ninja cmake git \
