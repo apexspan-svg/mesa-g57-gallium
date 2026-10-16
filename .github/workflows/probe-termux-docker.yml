@@ -1,7 +1,5 @@
 name: probe-termux-docker
 
-# One-off experiment: can the official Termux docker image execute on the
-# arm64 runner (i.e. is the bionic loader problem solved inside it)?
 on:
   workflow_dispatch:
 
@@ -9,8 +7,11 @@ jobs:
   probe:
     runs-on: ubuntu-24.04-arm
     steps:
-      - name: Pull and run Termux image
+      - name: Inspect image shells and libs
         run: |
-          docker pull termux/termux-docker:aarch64
-          docker run --rm termux/termux-docker:aarch64 \
-            bash -c 'echo PROBE-START; ls /system/bin/linker64 2>&1; echo hello-from-termux-docker; pkg --version 2>&1 | head -1'
+          docker pull termux/termux-docker:aarch64@sha256:d9e15c9751ed0e5d436ca32f97bf02b670cc004df4b01b7bfd8d145a84ba0575
+          IMG=termux/termux-docker:aarch64@sha256:d9e15c9751ed0e5d436ca32f97bf02b670cc004df4b01b7bfd8d145a84ba0575
+          echo "--- default entrypoint, which bash:"; docker run --rm "$IMG" which bash sh echo || true
+          echo "--- PREFIX lib set:"; docker run --rm "$IMG" ls /data/data/com.termux/files/usr/lib/ | head -30 || true
+          echo "--- libandroid-support present?:"; docker run --rm "$IMG" ls /data/data/com.termux/files/usr/lib/libandroid-support.so 2>&1 || true
+          echo "--- system lib dir:"; docker run --rm "$IMG" ls /system/lib64/ 2>&1 | head -20 || true
