@@ -31,6 +31,7 @@
 #include <xcb/dri3.h>
 #include <xcb/present.h>
 #include <xcb/xfixes.h>
+#include "loader.h"
 
 /** x11_dri3_open
  *
@@ -51,7 +52,7 @@ x11_dri3_open(xcb_connection_t *conn,
    xcb_prefetch_extension_data(conn, &xcb_dri3_id);
    extension = xcb_get_extension_data(conn, &xcb_dri3_id);
    if (!(extension && extension->present))
-      return -1;
+      goto kbase_fallback;
 
    cookie = xcb_dri3_open(conn,
                           root,
@@ -61,7 +62,7 @@ x11_dri3_open(xcb_connection_t *conn,
 
    if (!reply || reply->nfd != 1) {
       free(reply);
-      return -1;
+      goto kbase_fallback;
    }
 
    fd = xcb_dri3_open_reply_fds(conn, reply)[0];
@@ -79,7 +80,17 @@ x11_dri3_open(xcb_connection_t *conn,
    }
    free(fixes_reply);
 
-   return fd;
+   if (fd >= 0)
+      return fd;
+
+kbase_fallback:
+   /* No DRI3-capable X server (e.g. stock Android kbase has no DRM node).
+    * Fall back to Arm's kbase node, which gallium panfrost drives through
+    * its kbase backend. Downstream present paths must not assume DRM. */
+   {
+      const char *node = getenv("MESA_KBASE_NODE");
+      return loader_open_device(node ? node : "/dev/mali0");
+   }
 }
 
 /* Only request versions of these protocols which we actually support. */
