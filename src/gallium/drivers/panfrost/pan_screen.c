@@ -494,20 +494,26 @@ panfrost_walk_dmabuf_modifiers(struct pipe_screen *screen,
 #ifdef HAVE_PAN_KMOD_KBASE
    /* Raw-FD present marker for Termux:X11/Winlator: single-plane formats
     * that also admit LINEAR get an exportable linear twin. External-only:
-    * only meaningful across processes (present). */
+    * only meaningful across processes (present). Note modifiers may be
+    * NULL on count queries: never dereference it then, test LINEAR
+    * support directly instead. */
    if (pan_kbase_jm_is_kbase(dev) && !is_yuv &&
        util_format_get_num_planes(format) == 1 &&
        (test_modifier == DRM_FORMAT_MOD_INVALID ||
         test_modifier == PAN_KBASE_RAW_FD_MODIFIER)) {
       bool linear_ok = false;
-      for (unsigned i = 0; i < (unsigned)count && !linear_ok; ++i)
-         linear_ok = (modifiers[i] == DRM_FORMAT_MOD_LINEAR);
-      if (linear_ok && max > (int)count) {
-         modifiers[count] = PAN_KBASE_RAW_FD_MODIFIER;
-         if (external_only)
+      if (modifiers) {
+         for (unsigned i = 0; i < (unsigned)count && !linear_ok; ++i)
+            linear_ok = (modifiers[i] == DRM_FORMAT_MOD_LINEAR);
+      } else {
+         linear_ok = pan_image_test_modifier_with_format(
+            &dev->kmod.dev->props, DRM_FORMAT_MOD_LINEAR, format);
+      }
+      if (linear_ok) {
+         if (max > (int)count && modifiers)
+            modifiers[count] = PAN_KBASE_RAW_FD_MODIFIER;
+         if (external_only && max > (int)count)
             external_only[count] = true;
-         count++;
-      } else if (linear_ok) {
          count++;
       }
    }
