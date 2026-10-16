@@ -75,7 +75,7 @@ jobs:
       - name: Build + stage install
         run: |
           /entrypoint.sh ninja -C build-termux
-          /entrypoint.sh env DESTDIR=/tmp/stage ninja -C build-termux install
+          /entrypoint.sh env DESTDIR=/repo/stage ninja -C build-termux install
 
       - name: Package Termux drop-in
         run: |
