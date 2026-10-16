@@ -20,9 +20,10 @@ jobs:
         run: |
           docker pull termux/termux-docker:aarch64@sha256:d9e15c9751ed0e5d436ca32f97bf02b670cc004df4b01b7bfd8d145a84ba0575
           chmod -R a+rwX "${{ github.workspace }}"
-          docker run --rm --user root -v "${{ github.workspace }}:/repo" \
-            --entrypoint /data/data/com.termux/files/usr/bin/bash \
-            termux/termux-docker:aarch64@sha256:d9e15c9751ed0e5d436ca32f97bf02b670cc004df4b01b7bfd8d145a84ba0575 -c '
+          # No --user/--entrypoint overrides: the image is designed to run as
+          # uid 1000 (file owner) with entrypoint.sh passing commands through.
+          docker run --rm -v "${{ github.workspace }}:/repo" \
+            termux/termux-docker:aarch64@sha256:d9e15c9751ed0e5d436ca32f97bf02b670cc004df4b01b7bfd8d145a84ba0575 bash -c '
             set -ex
             # Image runs as root here; Termux pkg/apt refuse uid 0.
             # Neutralize the shell-script root guard (pinned image digest).
