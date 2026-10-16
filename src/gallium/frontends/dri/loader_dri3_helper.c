@@ -1513,11 +1513,17 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
          const char *termux_wsi = getenv("WSI_X11_TERMUX");
          fprintf(stderr, "TMPDBG rawforce env=%s modsnull=%d\n",
                  termux_wsi ? termux_wsi : "(null)", modifiers == NULL);
-         if (termux_wsi && strcmp(termux_wsi, "0") != 0 && modifiers == NULL) {
+         /* The server may offer modifiers without 1274 (or none at all)
+          * yet still import 1274-marked raw FDs; that is the whole point
+          * of the private marker. Override whenever the switch is on and
+          * the driver supports it. */
+         if (termux_wsi && strcmp(termux_wsi, "0") != 0) {
             uint64_t raw_fd_mod = 1274ull; /* PAN_KBASE_RAW_FD_MODIFIER */
             bool hs = has_supported_modifier(draw, fourcc, &raw_fd_mod, 1);
             fprintf(stderr, "TMPDBG rawforce has_supported=%d\n", hs);
             if (hs) {
+               free(modifiers);
+               modifiers = NULL;
                modifiers = malloc(sizeof(uint64_t));
                if (modifiers) {
                   modifiers[0] = raw_fd_mod;
@@ -1526,6 +1532,7 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
                }
             }
          }
+         fprintf(stderr, "TMPDBG rawforce use_raw_fd=%d\n", use_raw_fd);
       }
       buffer->image = dri_create_image_with_modifiers(draw->dri_screen_render_gpu,
                                               width, height, format,
