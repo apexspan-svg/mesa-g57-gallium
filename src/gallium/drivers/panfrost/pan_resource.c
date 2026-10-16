@@ -26,11 +26,13 @@
 #include "util/streaming-load-memcpy.h"
 
 #include "decode.h"
-#include "pan_afbc.h"#include "pan_afrc.h"
+#include "pan_afbc.h"
+#include "pan_afrc.h"
 #include "pan_blitter.h"
 #include "pan_bo.h"
 #include "pan_context.h"
-#include "pan_resource.h"#include "pan_screen.h"
+#include "pan_resource.h"
+#include "pan_screen.h"
 #include "pan_tiling.h"
 #include "pan_trace.h"
 
