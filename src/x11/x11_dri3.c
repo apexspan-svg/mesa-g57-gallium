@@ -31,7 +31,11 @@
 #include <xcb/dri3.h>
 #include <xcb/present.h>
 #include <xcb/xfixes.h>
-#include "loader.h"
+
+/* From src/loader/loader.h; declared locally to avoid pulling loader.h's
+ * transitive includes into libloader_x11 (which processes before src/loader
+ * in meson). */
+int loader_open_device(const char *device_name);
 
 /** x11_dri3_open
  *
