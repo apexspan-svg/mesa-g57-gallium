@@ -24,8 +24,8 @@ jobs:
             --entrypoint /data/data/com.termux/files/usr/bin/bash \
             termux/termux-docker:aarch64@sha256:d9e15c9751ed0e5d436ca32f97bf02b670cc004df4b01b7bfd8d145a84ba0575 -c '
             set -ex
-            pkg update -y
-            pkg install -y python clang bison flex pkg-config ninja cmake git \
+            apt-get update -y
+            apt-get install -y python clang bison flex pkg-config ninja cmake git \
               libdrm xorgproto libx11 libxcb libxshmfence \
               libandroid-shmem-static spirv-tools spirv-llvm-translator \
               libclc glslang
