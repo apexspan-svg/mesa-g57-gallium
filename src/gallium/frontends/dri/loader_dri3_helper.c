@@ -1170,13 +1170,19 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
 
       if (!draw->region) {
          draw->region = xcb_generate_id(draw->conn);
-         xcb_xfixes_create_region(draw->conn, draw->region, 0, NULL);
+         /* Some servers (e.g. Termux:X11) advertise XFixes but reject
+          * region creation. Fall back to full-window present (region 0)
+          * instead of dying on the unchecked error later. */
+         xcb_void_cookie_t rc = xcb_xfixes_create_region_checked(
+            draw->conn, draw->region, 0, NULL);
+         if (!check_xcb_error(rc, "xcb_xfixes_create_region"))
+            draw->region = 0;
       }
 
       xcb_xfixes_region_t region = 0;
       xcb_rectangle_t xcb_rects[64];
 
-      if (n_rects > 0 && n_rects <= ARRAY_SIZE(xcb_rects)) {
+      if (draw->region && n_rects > 0 && n_rects <= ARRAY_SIZE(xcb_rects)) {
          for (int i = 0; i < n_rects; i++) {
             const int *rect = &rects[i * 4];
             xcb_rects[i].x = rect[0];
