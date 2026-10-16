@@ -4,6 +4,10 @@ on:
   workflow_dispatch:
   push:
     branches: [main, gallium-kbase-jm-v1]
+    paths-ignore:
+      - '.github/workflows/build-termux.yml'
+      - '.github/workflows/probe-termux-docker.yml'
+      - '.github/run-in-termux.sh'
 
 jobs:
   build:
