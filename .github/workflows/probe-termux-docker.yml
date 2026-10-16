@@ -15,3 +15,4 @@ jobs:
           echo "--- PREFIX lib set:"; docker run --rm "$IMG" ls /data/data/com.termux/files/usr/lib/ | head -30 || true
           echo "--- libandroid-support present?:"; docker run --rm "$IMG" ls /data/data/com.termux/files/usr/lib/libandroid-support.so 2>&1 || true
           echo "--- system lib dir:"; docker run --rm "$IMG" ls /system/lib64/ 2>&1 | head -20 || true
+          echo "--- pkg root guard:"; docker run --rm --entrypoint /data/data/com.termux/files/usr/bin/bash "$IMG" -c 'grep -n -B1 -A3 "id -u\|EUID" /data/data/com.termux/files/usr/bin/pkg /data/data/com.termux/files/usr/bin/apt-get 2>&1 | head -20' || true
