@@ -1,59 +1,83 @@
 name: termux-native-gallium
 
-# True Termux binaries ($PREFIX, bionic) via the official Termux docker
-# image on an arm64 runner. Replaces the proot attempt (proot cannot run
-# bionic binaries without Android's loader; the docker image ships it).
+# True Termux binaries ($PREFIX, bionic) built inside the official Termux
+# docker image, following the proven guijan/robertkirkman termux-on-gha
+# pattern (container job + /entrypoint.sh prefix + bionic node for upload).
+# Produces a $PREFIX drop-in tarball for Termux/X11 (WSI); the NDK job
+# remains the Android (gralloc) build.
 on:
   workflow_dispatch:
-  # push trigger removed: image lacks $PREFIX libs (libandroid-support);
-  # re-enable once the base image is complete. See NDK job for drivers.
+  push:
+    branches: [main]
 
 jobs:
   build:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 300
+    container:
+      image: termux/termux-docker:aarch64@sha256:d9e15c9751ed0e5d436ca32f97bf02b670cc004df4b01b7bfd8d145a84ba0575
+      volumes:
+        - /tmp/node20:/__e/node20
+      options: --privileged
+    env:
+      TERMUX_MAIN_PACKAGE_FORMAT: debian
+      ANDROID_ROOT: /system
+      ANDROID_DATA: /data
+      PREFIX: /data/data/com.termux/files/usr
+      HOME: /data/data/com.termux/files/home
+      PATH: /data/data/com.termux/files/usr/bin
+      TMPDIR: /data/data/com.termux/files/usr/tmp
+      LANG: en_US.UTF-8
+      TZ: UTC
     steps:
-      - name: Check out
-        uses: actions/checkout@v4
+      - name: Allow more pids in container
+        run: /entrypoint_root.sh sh -c "echo 65535 | tee /proc/sys/kernel/pid_max"
 
-      - name: Build inside Termux container
+      - name: Default package mirror
+        run: ln -sf ${PREFIX}/etc/termux/mirrors/default ${PREFIX}/etc/termux/chosen_mirrors
+
+      - name: Fix executable bit for container tooling
+        run: chmod -R o+x ${PREFIX}/bin
+
+      - name: Install bionic nodejs for actions compatibility
         run: |
-          docker pull termux/termux-docker:aarch64@sha256:d9e15c9751ed0e5d436ca32f97bf02b670cc004df4b01b7bfd8d145a84ba0575
-          chmod -R a+rwX "${{ github.workspace }}"
-          # No --user/--entrypoint overrides: the image is designed to run as
-          # uid 1000 (file owner) with entrypoint.sh passing commands through.
-          docker run --rm -v "${{ github.workspace }}:/repo" \
-            termux/termux-docker:aarch64@sha256:d9e15c9751ed0e5d436ca32f97bf02b670cc004df4b01b7bfd8d145a84ba0575 bash -c '
-            set -ex
-            # Image runs as root here; Termux pkg/apt refuse uid 0.
-            # Neutralize the shell-script root guard (pinned image digest).
-            PFX=/data/data/com.termux/files/usr
-            sed -i "s|id -u\" == \"0\"|id -u\" == \"never\"|" \
-              "$PFX/bin/pkg" "$PFX/bin/apt" "$PFX/bin/apt-get" "$PFX/bin/apt-mark" 2>/dev/null || true
-            pkg update -y
-            pkg install -y python clang bison flex pkg-config ninja cmake git \
-              libdrm xorgproto libx11 libxcb libxshmfence libxext libxrandr libxxf86vm libxfixes \
-              libandroid-shmem-static spirv-tools spirv-llvm-translator \
-              libclc glslang
-            pip install -q meson mako pyyaml packaging setuptools
-            cd /repo
-            meson setup build-termux \
-              -Dbuildtype=release \
-              -Dgallium-drivers=panfrost \
-              -Dvulkan-drivers= \
-              -Dplatforms=x11 \
-              -Dpanfrost-kmds=kbase,panthor \
-              -Dbuild-tests=false \
-              -Dprefix=/data/data/com.termux/files/usr \
-              -Dc_link_args=-landroid-shmem \
-              -Dcpp_link_args=-landroid-shmem
-            ninja -C build-termux
-            DESTDIR=/repo/stage ninja -C build-termux install
-            '
+          /entrypoint.sh pkg install -y nodejs-lts
+          ln -sf ${PREFIX}/bin /__e/node20/bin
+
+      - uses: actions/checkout@v4
+
+      - name: Fix repo ownership after checkout
+        run: chown -R 1000:1000 .
+
+      - name: Install Termux build deps
+        run: |
+          /entrypoint.sh pkg install -y python clang bison flex pkg-config ninja cmake git \
+            libdrm xorgproto libx11 libxcb libxshmfence libxext libxrandr libxxf86vm libxfixes \
+            libandroid-shmem-static spirv-tools spirv-llvm-translator \
+            libclc glslang
+          /entrypoint.sh pip install -q meson mako pyyaml packaging setuptools
+
+      - name: Configure (Gallium panfrost + kbase, x11)
+        run: |
+          /entrypoint.sh meson setup build-termux \
+            -Dbuildtype=release \
+            -Dgallium-drivers=panfrost \
+            -Dvulkan-drivers= \
+            -Dplatforms=x11 \
+            -Dpanfrost-kmds=kbase,panthor \
+            -Dbuild-tests=false \
+            -Dprefix=/data/data/com.termux/files/usr \
+            -Dc_link_args=-landroid-shmem \
+            -Dcpp_link_args=-landroid-shmem
+
+      - name: Build + stage install
+        run: |
+          /entrypoint.sh ninja -C build-termux
+          /entrypoint.sh env DESTDIR=/tmp/stage ninja -C build-termux install
 
       - name: Package Termux drop-in
         run: |
-          cd stage/data/data/com.termux/files/usr
+          cd /tmp/stage/data/data/com.termux/files/usr
           tar -czf "$GITHUB_WORKSPACE/panfrost-g57-termux.tar.gz" lib/
 
       - name: Upload Termux package
