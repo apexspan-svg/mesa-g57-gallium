@@ -54,6 +54,15 @@ Environment (Dimensity 6300, Android 13, Termux unprivileged):
   need dma-heap/AHB backing from birth (`PAN_BO_EXPORTABLE`).
 - Our targets: glmark2 ≥143 (apexspan Zink number, minus translation tax).
 
+## Known issues
+- Slow process teardown (1-4 min after score print) on heavy runs, with
+  `KBASE_IOCTL_MEM_FREE Operation not permitted` noise. Renders/benchmarks
+  unaffected (score prints first). Suspects: per-BO teardown cost at
+  volume, SAME_VA free-after-munmap ordering, or shm-fence waits.
+  Repro: full glmark2; single scene exits clean. Small-BO exits instant.
+- `PAN_KBASE_STATS=1` baseline: ~1.4-1.5ms blocked per batch (includes
+  GPU execution under synchronous submit; cf. PanVK 156us driver CPU).
+
 ## Measured (Dimensity 6300, Termux:X11, taskset -c 6,7, 640x480)
 - glmark2 Score: **226** (vs 143 Zink-on-PanVK, +58%), all scenes complete,
   no crashes. Scene range ~170-326 FPS; heavy scenes 23/61 FPS.
