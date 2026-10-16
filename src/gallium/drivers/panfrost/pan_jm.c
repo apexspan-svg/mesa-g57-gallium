@@ -227,6 +227,27 @@ jm_kbase_track_batch(struct panfrost_device *dev,
 }
 #endif
 
+#ifdef HAVE_PAN_KMOD_KBASE
+/* True when this batch renders to a display-bound resource. Such batches
+ * are what swap presents, and present has no driver hook to wait on, so
+ * they always submit synchronously: a fully-rendered frame at present
+ * time, with no tearing, no dma-fence needed. Everything else may go
+ * async. */
+static bool
+jm_batch_targets_display(struct panfrost_batch *batch)
+{
+   for (unsigned i = 0; i < batch->key.nr_cbufs; i++) {
+      struct pipe_surface *surf = batch->key.cbufs[i];
+      if (surf && surf->texture &&
+          (surf->texture->bind & (PIPE_BIND_SCANOUT |
+                                  PIPE_BIND_DISPLAY_TARGET |
+                                  PIPE_BIND_SHARED)))
+         return true;
+   }
+   return false;
+}
+#endif
+
 /* Submit both vertex/tiler and fragment jobs for a batch, possibly with an
  * outsync corresponding to the later of the two (since there will be an
  * implicit dep between them) */
@@ -255,7 +276,7 @@ GENX(jm_submit_batch)(struct panfrost_batch *batch)
       if (has_tiler)
          pthread_mutex_lock(&dev->submit_lock);
 
-      if (pan_kbase_async_enabled()) {
+      if (pan_kbase_async_enabled() && !jm_batch_targets_display(batch)) {
          uint64_t seq = pan_kbase_async_submit_batch(
             dev, has_draws ? batch->jm.jobs.vtc_jc.first_job : 0,
             has_frag ? batch->jm.jobs.frag : 0, reqs,
@@ -263,6 +284,13 @@ GENX(jm_submit_batch)(struct panfrost_batch *batch)
          jm_kbase_track_batch(dev, batch, seq);
          ret = seq ? 0 : EIO;
       } else {
+         /* Synchronous: display-bound (present must see complete frames)
+          * or async compiled out. Drain any outstanding async work first
+          * so kernel order matches program order. */
+         if (pan_kbase_async_enabled() &&
+             !pan_kbase_async_seq_done(pan_kbase_async_last_seq()))
+            pan_kbase_async_wait_seq(dev, pan_kbase_async_last_seq(),
+                                     INT64_MAX);
          ret = pan_kbase_jm_submit_batch(
             dev, has_draws ? batch->jm.jobs.vtc_jc.first_job : 0,
             has_frag ? batch->jm.jobs.frag : 0, reqs,

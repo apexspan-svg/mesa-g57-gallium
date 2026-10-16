@@ -47,10 +47,11 @@ int pan_kbase_jm_submit_batch(struct panfrost_device *dev, uint64_t vtc_jc,
  * while CPU batch preparation overlaps GPU execution.
  *
  * Sequence numbers identify submissions; resources remember the seq of
- * their last writer so reuse waits precisely. Present (swap) is NOT
- * synchronized in this phase: with async on, a swap may display a
- * not-yet-complete buffer (tearing). Benchmarks are unaffected; visual
- * correctness of swap returns in Phase C (present waits / dma-fence).
+ * their last writer so reuse waits precisely. Batches rendering to
+ * display-bound resources (SCANOUT/DISPLAYTARGET/SHARED targets: what
+ * swap presents) always submit synchronously after draining, since swap
+ * has no driver hook to wait on — present is therefore always correct,
+ * at the cost of pipelining exactly those frames.
  */
 bool pan_kbase_async_enabled(void);
 
