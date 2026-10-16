@@ -20,7 +20,8 @@ jobs:
         run: |
           docker pull termux/termux-docker:aarch64
           docker run --rm --user "$(id -u):$(id -g)" -v "${{ github.workspace }}:/repo" \
-            termux/termux-docker:aarch64 bash -c '
+            --entrypoint /data/data/com.termux/files/usr/bin/bash \
+            termux/termux-docker:aarch64 -c '
             set -ex
             pkg update -y
             pkg install -y python clang bison flex pkg-config ninja cmake git \
