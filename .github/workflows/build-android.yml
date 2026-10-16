@@ -8,6 +8,9 @@ on:
       - '.github/workflows/build-termux.yml'
       - '.github/workflows/probe-termux-docker.yml'
       - '.github/run-in-termux.sh'
+      - 'README.md'
+      - 'G57_NOTES.md'
+      - 'tests/**'
 
 jobs:
   build:
