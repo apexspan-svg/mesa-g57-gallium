@@ -5,8 +5,8 @@ name: termux-native-gallium
 # bionic binaries without Android's loader; the docker image ships it).
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
+  # push trigger removed: image lacks $PREFIX libs (libandroid-support);
+  # re-enable once the base image is complete. See NDK job for drivers.
 
 jobs:
   build:
