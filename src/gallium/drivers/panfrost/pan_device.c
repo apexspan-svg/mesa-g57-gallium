@@ -61,12 +61,13 @@ panfrost_open_device(void *memctx, int fd, struct panfrost_device *dev)
    dev->arch = pan_arch(dev->kmod.dev->props.gpu_id);
    dev->model = pan_get_model(dev->kmod.dev->props.gpu_id,
                               dev->kmod.dev->props.gpu_variant);
-   fprintf(stderr, "TMPDBG open_device arch=%u model=%p\n", dev->arch,
-           (void *)dev->model);
+
 
    /* If we don't recognize the model, bail early */
-   if (!dev->model)
+   if (!dev->model) {
+      mesa_loge("panfrost: unrecognised GPU ID 0x%"PRIx64, dev->kmod.dev->props.gpu_id);
       goto err_free_kmod_dev;
+   }
 
    /* 48bit address space max, with the lower 32MB reserved. We clamp
     * things so it matches kmod VA range limitations.
@@ -79,9 +80,10 @@ panfrost_open_device(void *memctx, int fd, struct panfrost_device *dev)
    dev->kmod.vm = pan_kmod_vm_create(
       dev->kmod.dev, PAN_KMOD_VM_FLAG_AUTO_VA | PAN_KMOD_VM_FLAG_TRACK_ACTIVITY,
       user_va_start, user_va_end - user_va_start);
-   fprintf(stderr, "TMPDBG open_device vm=%p\n", (void *)dev->kmod.vm);
-   if (!dev->kmod.vm)
+   if (!dev->kmod.vm) {
+      mesa_loge("panfrost: failed to create GPU VM");
       goto err_free_kmod_dev;
+   }
 
    dev->core_count = pan_query_core_count(&dev->kmod.dev->props);
    dev->core_id_range = pan_query_core_id_range(&dev->kmod.dev->props);
@@ -122,8 +124,10 @@ panfrost_open_device(void *memctx, int fd, struct panfrost_device *dev)
    if (dev->arch < 10) {
       dev->tiler_heap = panfrost_bo_create(
          dev, 128 * 1024 * 1024, PAN_BO_INVISIBLE | PAN_BO_GROWABLE, "Tiler heap");
-      if (!dev->tiler_heap)
+      if (!dev->tiler_heap) {
+         mesa_loge("panfrost: failed to allocate tiler heap");
          goto err_free_kmod_dev;
+      }
    }
 
    pthread_mutex_init(&dev->submit_lock, NULL);
@@ -131,8 +135,10 @@ panfrost_open_device(void *memctx, int fd, struct panfrost_device *dev)
    /* Done once on init */
    dev->sample_positions = panfrost_bo_create(
       dev, pan_sample_positions_buffer_size(), 0, "Sample positions");
-   if (!dev->sample_positions)
+   if (!dev->sample_positions) {
+      mesa_loge("panfrost: failed to allocate sample positions");
       goto err_free_kmod_dev;
+   }
 
    pan_upload_sample_positions(dev->sample_positions->ptr.cpu);
    return 0;
@@ -207,8 +213,7 @@ panfrost_open_device_kbase(void *memctx, const char *path,
    dev->arch = pan_arch(dev->kmod.dev->props.gpu_id);
    dev->model = pan_get_model(dev->kmod.dev->props.gpu_id,
                               dev->kmod.dev->props.gpu_variant);
-   fprintf(stderr, "TMPDBG open_device arch=%u model=%p\n", dev->arch,
-           (void *)dev->model);
+
 
    if (!dev->model) {
       mesa_loge("panfrost: unrecognised GPU ID 0x%"PRIx64,
@@ -224,9 +229,10 @@ panfrost_open_device_kbase(void *memctx, const char *path,
    dev->kmod.vm = pan_kmod_vm_create(
       dev->kmod.dev, PAN_KMOD_VM_FLAG_AUTO_VA | PAN_KMOD_VM_FLAG_TRACK_ACTIVITY,
       user_va_start, user_va_end - user_va_start);
-   fprintf(stderr, "TMPDBG open_device vm=%p\n", (void *)dev->kmod.vm);
-   if (!dev->kmod.vm)
+   if (!dev->kmod.vm) {
+      mesa_loge("panfrost: failed to create GPU VM");
       goto err_free_kmod_dev;
+   }
 
    dev->core_count = pan_query_core_count(&dev->kmod.dev->props);
    dev->core_id_range = pan_query_core_id_range(&dev->kmod.dev->props);
