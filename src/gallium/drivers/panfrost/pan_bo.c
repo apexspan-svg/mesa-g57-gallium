@@ -61,18 +61,26 @@ panfrost_bo_alloc(struct panfrost_device *dev, size_t size, uint32_t flags,
 {
    struct pan_kmod_vm *exclusive_vm =
       !(flags & PAN_BO_SHAREABLE) ? dev->kmod.vm : NULL;
-   struct pan_kmod_bo *kmod_bo;
+   struct pan_kmod_bo *kmod_bo = NULL;
    struct panfrost_bo *bo;
 
 #ifdef HAVE_PAN_KMOD_KBASE
    /* Exportable resources need dma-buf-capable backing from birth: native
-    * kbase MEM_ALLOC BOs have no dma-buf and can never be exported. */
+    * kbase MEM_ALLOC BOs have no dma-buf and can never be exported. Fall
+    * back to a native BO (unexportable, today's behavior) if the
+    * exportable path is unavailable. */
    if ((flags & PAN_BO_EXPORTABLE) && pan_kbase_jm_is_kbase(dev)) {
       kmod_bo = kbase_kmod_bo_alloc_exportable(dev->kmod.dev, size,
                                                to_kmod_bo_flags(flags));
       fprintf(stderr, "TMPDBG bo_alloc exportable size=%zu -> %s\n",
               size, kmod_bo ? "OK" : "FAIL");
-   } else
+      if (!kmod_bo) {
+         flags &= ~PAN_BO_EXPORTABLE;
+         mesa_logw("panfrost/kbase: exportable alloc failed, using native BO "
+                   "(fd export will fail)");
+      }
+   }
+   if (!kmod_bo)
 #endif
       kmod_bo = pan_kmod_bo_alloc(dev->kmod.dev, exclusive_vm, size,
                                   to_kmod_bo_flags(flags));

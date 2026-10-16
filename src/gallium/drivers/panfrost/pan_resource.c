@@ -1145,6 +1145,15 @@ panfrost_resource_create_with_modifier(struct pipe_screen *screen,
 #ifdef HAVE_PAN_KMOD_KBASE
       if (kbase_raw_fd)
          flags |= PAN_BO_EXPORTABLE;
+
+      /* Modifier-less present (servers offering zero modifiers): scanout and
+       * shared linear resources must still export a dma-buf fd, so back them
+       * exportable from birth. Native kbase BOs can never be exported. */
+      if (!kbase_raw_fd && pan_kbase_jm_is_kbase(dev) &&
+          (template->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET |
+                             PIPE_BIND_SHARED)) &&
+          modifier == DRM_FORMAT_MOD_LINEAR)
+         flags |= PAN_BO_EXPORTABLE;
 #endif
 
       char *res_label =
