@@ -64,9 +64,15 @@ Environment (Dimensity 6300, Android 13, Termux unprivileged):
   GPU execution under synchronous submit; cf. PanVK 156us driver CPU).
 
 ## Measured (Dimensity 6300, Termux:X11, taskset -c 6,7, 640x480)
-- glmark2 Score: **226** (vs 143 Zink-on-PanVK, +58%), all scenes complete,
-  no crashes. Scene range ~170-326 FPS; heavy scenes 23/61 FPS.
+- glmark2 Score: **226**, later **281**, later **421** (vs 143 Zink-on-PanVK),
+  all scenes complete, no crashes. Scene range now ~370-600 FPS light,
+  heavy scenes 23-123 FPS. Variance across runs is thermal/load, not code:
+  same binaries score differently hot vs cool. Always `taskset -c 6,7`.
 - glxgears: vsync-locked ~60 FPS sustained (swap paced, no errors).
+- SPILL retry never fires on glmark2 (no spilling shaders there) nor on a
+  synthetic 8-varying stress shader: dormant as designed, no regressions.
+- Teardown slowness is intermittent (minutes some runs, prompt others);
+  still under investigation, benchmarks unaffected.
 
 ## kbase version notes
 - Atom stride is kernel-version dependent (BossDrk, G52/r49: 56 bytes vs
