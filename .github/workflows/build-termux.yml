@@ -18,6 +18,7 @@ jobs:
       image: termux/termux-docker:aarch64@sha256:d9e15c9751ed0e5d436ca32f97bf02b670cc004df4b01b7bfd8d145a84ba0575
       volumes:
         - /tmp/node20:/__e/node20
+        - /tmp/node24:/__e/node24
       options: --privileged
     env:
       TERMUX_MAIN_PACKAGE_FORMAT: debian
@@ -43,6 +44,7 @@ jobs:
         run: |
           /entrypoint.sh pkg install -y nodejs-lts
           ln -sf ${PREFIX}/bin /__e/node20/bin
+          ln -sf ${PREFIX}/bin /__e/node24/bin
 
       - uses: actions/checkout@v4
 
