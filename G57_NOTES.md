@@ -1,34 +1,66 @@
-# Mali-G57 notes (hardware-earned, from sister projects)
+# Mali-G57 notes (hardware-earned, ours + sister projects)
 
-## Verified in our tree
-- Tiler hierarchy mask: upstream `pan_select_tiler_hierarchy_mask` — no
-  `0xFE` Valhall-tuning present. The `0x58 DATA_INVALID_FAULT` class
-  HapplyCardo hit does not apply (`pan_jm.c`, `pan_tiler.c` checked).
-- v9 `MALLOC_VERTEX` VARYING block: upstream rewrite, correct
-  `if (!secondary_shader) continue` + `jm_emit_shader_env`. The panfork-23
-  brace/`vary.shader` bug (HapplyCardo `4c42d497`) has no equivalent here.
-- Atom completion: synchronous submit+wait makes 8-bit atom-ID wrap
-  impossible (one in flight). HapplyCardo's drain-before-wrap concern
-  applies only to async designs — revisit in the async port.
+Environment (Dimensity 6300, Android 13, Termux unprivileged):
+- `/dev/mali0` is world-RW (`crw-rw-rw-`): kbase reachable without root.
+- `/dev/dri/*` is `system:system`: DRM present/prime paths are unusable.
+  Every display path must avoid DRM (SHM or raw-FD dma-buf).
+- kbase JM uAPI 11.38 here; r49-era kernels differ (see stride).
+
+## Verified in our tree (device-tested)
+- EGL surfaceless init on `/dev/mali0` via `MESA_KBASE_NODE`.
+- Clear, flat-shaded triangle, textured quad (texel-exact) — all PASS.
+- GLX direct context (`direct=1`, correct renderer) via `x11_dri3_open`
+  fallback; no env vars needed for device acquisition.
+- Visible triangle + textured quad in X11 windows (SHM present, app-side).
+- Tiler hierarchy mask: upstream selection, no `0xFE` tuning → no `0x58`
+  class from HapplyCardo.
+- v9 `MALLOC_VERTEX` VARYING block: upstream rewrite is sound; textured
+  PASS covers the varying path HapplyCardo's bug lived in.
+
+## Loader hooks (all gated, no-op without kbase/MESA_KBASE_NODE)
+- `loader_fd_is_kbase()` (`src/loader/loader.c`): `/proc/self/fd` sniffing
+  maps `/dev/mali*` to driver `panfrost`.
+- `MESA_KBASE_NODE` in surfaceless + android EGL probe (JimVulkan pattern).
+- `x11_dri3_open` kbase fallback (GLX/EGL-x11/kopper in one).
+
+## Present findings (Termux:X11 server)
+- Server offers ZERO window modifiers (probed) yet imports 1274-marked
+  raw dma-buf FDs (PanVK-proven; the marker is deliberately unadvertised).
+- Server rejects `PixmapFromBuffers` with standard modifiers (BadRequest).
+- Server rejects `xcb_xfixes_create_region` despite advertising XFixes 5.0:
+  damage regions must be optional with full-present fallback.
+- No DRI3 explicit sync on raw path: driver must be GPU-idle before
+  queueing the pixmap (true for our synchronous submit).
+- Xvfb `-fbdir` files do NOT reflect SHM-put content; verify windows with
+  `GetImage`, not the fb file.
+
+## Submit design (current: synchronous)
+- One `JOB_SUBMIT` per batch; frag `ORDER`-depends on vtc (panfork-style,
+  halves kernel round trips vs split+wait). `PAN_KBASE_SPLIT=1` restores
+  split submits for kernels whose ORDER deps misbehave.
+- `core_req`: frag `FS`, vtc `CS|T` (PanVK-proven on G57). JimVulkan's
+  traced values (`0x4e`/`0x8001`) kept as alternative, untested here.
+- One process-wide submit mutex: batch order on the wire equals program
+  order; event matching unambiguous; 8-bit atom wrap impossible.
+- Fences truthfully signaled (submit blocks). Async port must use `>=`
+  seq comparison (HapplyCardo `4c42d497`) and per-BO tracking.
 
 ## Adopt when relevant
-- Fence seq comparison must be `>=`, not `>` (HapplyCardo `4c42d497`:
-  completion at exactly the waited value must signal, else waits time
-  out). Applies to the planned async event layer, not the current
-  synchronous submit.
-- AFBC: disable on G57 kbase until proven (`PANVK_NO_AFBC=1` precedent in
-  apexspan; `PAN_BASE_QUIRK_NO_AFBC` in HapplyCardo). Suspect for any
-  future `DATA_INVALID_FAULT` in textured scenes.
-- Varying (textured) draws are the next untested v9 path: our PASS covers
-  clear + flat-shaded triangle only.
+- AFBC: disable on G57 kbase until proven (`PANVK_NO_AFBC=1` precedent;
+  `PAN_BASE_QUIRK_NO_AFBC`). Suspect for any future `DATA_INVALID_FAULT`
+  in textured scenes.
+- Big-core pinning (`taskset -c 6,7`, +2–7%) for every benchmark.
+- Native kbase `MEM_ALLOC` BOs can NEVER be exported; presentable resources
+  need dma-heap/AHB backing from birth (`PAN_BO_EXPORTABLE`).
+- Our targets: glmark2 ≥143 (apexspan Zink number, minus translation tax).
 
 ## kbase version notes
 - Atom stride is kernel-version dependent (BossDrk, G52/r49: 56 bytes vs
-  the usual 64). Our submit defaults to 64 (proven on JM 11.38) with
-  `PAN_KBASE_ATOM_STRIDE=56|64|72` override; FristOneRR auto-detects.
+  the usual 64). Default 64 (proven JM 11.38); override
+  `PAN_KBASE_ATOM_STRIDE=56|64|72`; FristOneRR auto-detects.
 
 ## Sources
-- HapplyCardo/mesa-Panfork-android `bifrost-g57` (`d8cb29f9`, `4c42d497`):
-  G57 bring-up on Dimensity 820, glmark2 + glxgears ~287 FPS.
-- JimVulkan/mali-panfrost: traced `core_req` values, async/event design.
-- apexspan/mesa-panvk-mali-g57: PanVK JM backend, X11 WSI reference.
+- HapplyCardo/mesa-Panfork-android `bifrost-g57` (`d8cb29f9`, `4c42d497`).
+- JimVulkan/mali-panfrost: traced `core_req`, async/event design.
+- apexspan/mesa-panvk-mali-g57: PanVK JM backend, X11/WSI reference.
+- termux/termux-docker#62 + guijan/robertkirkman termux-on-gha: CI pattern.
