@@ -1428,6 +1428,7 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
    uint32_t count = 0;
    int i, mod;
    int ret;
+   bool use_raw_fd = false;
 
    /* Create an xshmfence object and
     * prepare to send that to the X server
@@ -1499,6 +1500,25 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
          }
 
          free(mod_reply);
+      }
+
+      /* Termux:X11/Winlator raw-FD protocol (cf. PanVK WSI_X11_TERMUX):
+       * these servers offer no modifiers yet import 1274-marked dma-bufs
+       * as directly mmap-able raw FDs. Force 1274 when the switch is on,
+       * the server gave us nothing, and the driver advertises it. */
+      {
+         const char *termux_wsi = getenv("WSI_X11_TERMUX");
+         if (termux_wsi && strcmp(termux_wsi, "0") != 0 && modifiers == NULL) {
+            uint64_t raw_fd_mod = 1274ull; /* PAN_KBASE_RAW_FD_MODIFIER */
+            if (has_supported_modifier(draw, fourcc, &raw_fd_mod, 1)) {
+               modifiers = malloc(sizeof(uint64_t));
+               if (modifiers) {
+                  modifiers[0] = raw_fd_mod;
+                  count = 1;
+                  use_raw_fd = true;
+               }
+            }
+         }
       }
       buffer->image = dri_create_image_with_modifiers(draw->dri_screen_render_gpu,
                                               width, height, format,
@@ -1653,10 +1673,12 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
                                                  (sync_fence = xcb_generate_id(draw->conn)),
                                                  false,
                                                  fence_fd);
-   /* Group error checking to limit round-trips. */
+   /* Group error checking to limit round-trips. The raw-FD path has no
+    * DRI3 explicit sync on the server (cf. PanVK); the driver already
+    * waited for GPU completion, so skip the fence import there. */
    if (!check_xcb_error(cookie_pix, "xcb_dri3_pixmap_from_buffer[s]"))
       goto no_buffer_attrib;
-   if (!check_xcb_error(cookie_fence, "xcb_dri3_fence_from_fd"))
+   if (!use_raw_fd && !check_xcb_error(cookie_fence, "xcb_dri3_fence_from_fd"))
       goto no_buffer_attrib;
 
    buffer->pixmap = pixmap;
