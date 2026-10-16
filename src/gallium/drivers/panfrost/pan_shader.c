@@ -20,6 +20,7 @@
 #include "compiler/bifrost/bifrost_compile.h"
 #include "compiler/bifrost/bi_debug.h"
 #include "shader_enums.h"
+#include "util/log.h"
 
 #include <stdlib.h>
 
@@ -235,6 +236,8 @@ panfrost_shader_compile(struct panfrost_screen *screen, const nir_shader *ir,
       if (spill_noopt && out->info.tls_size) {
          /* compile_shader consumes its NIR input, so retry on a clone and
           * only keep the result if it produced a binary. */
+         mesa_logw("panfrost: shader spills (%uB TLS), recompiling without "
+                   "backend opts", out->info.tls_size);
          nir_shader *retry = nir_shader_clone(NULL, s);
          if (retry) {
             struct util_dynarray binary2 = UTIL_DYNARRAY_INIT;
