@@ -197,6 +197,36 @@ jm_submit_jc(struct panfrost_batch *batch, uint64_t first_job_desc,
    return 0;
 }
 
+#ifdef HAVE_PAN_KMOD_KBASE
+/* Record this batch's submission seq on every BO it touched, so reuse and
+ * free wait precisely. Mirrors the gpu_access flag maintenance of the DRM
+ * submit path. */
+static void
+jm_kbase_track_batch(struct panfrost_device *dev,
+                     struct panfrost_batch *batch, uint64_t seq)
+{
+   pan_bo_access *flags = util_dynarray_begin(&batch->bos);
+   unsigned end_bo = util_dynarray_num_elements(&batch->bos, pan_bo_access);
+
+   for (unsigned i = 0; i < end_bo; ++i) {
+      if (!flags[i])
+         continue;
+
+      struct panfrost_bo *bo = pan_lookup_bo(dev, i);
+      bo->gpu_access |= flags[i] & (PAN_BO_ACCESS_RW);
+      if (seq)
+         bo->kbase_seq = seq;
+   }
+
+   if (batch->jm.jobs.vtc_jc.first_tiler && dev->tiler_heap) {
+      if (seq)
+         dev->tiler_heap->kbase_seq = seq;
+   }
+   if (dev->sample_positions && seq)
+      dev->sample_positions->kbase_seq = seq;
+}
+#endif
+
 /* Submit both vertex/tiler and fragment jobs for a batch, possibly with an
  * outsync corresponding to the later of the two (since there will be an
  * implicit dep between them) */
@@ -225,10 +255,20 @@ GENX(jm_submit_batch)(struct panfrost_batch *batch)
       if (has_tiler)
          pthread_mutex_lock(&dev->submit_lock);
 
-      ret = pan_kbase_jm_submit_batch(
-         dev, has_draws ? batch->jm.jobs.vtc_jc.first_job : 0,
-         has_frag ? batch->jm.jobs.frag : 0, reqs,
-         reqs | PANFROST_JD_REQ_FS);
+      if (pan_kbase_async_enabled()) {
+         uint64_t seq = pan_kbase_async_submit_batch(
+            dev, has_draws ? batch->jm.jobs.vtc_jc.first_job : 0,
+            has_frag ? batch->jm.jobs.frag : 0, reqs,
+            reqs | PANFROST_JD_REQ_FS);
+         jm_kbase_track_batch(dev, batch, seq);
+         ret = seq ? 0 : EIO;
+      } else {
+         ret = pan_kbase_jm_submit_batch(
+            dev, has_draws ? batch->jm.jobs.vtc_jc.first_job : 0,
+            has_frag ? batch->jm.jobs.frag : 0, reqs,
+            reqs | PANFROST_JD_REQ_FS);
+         jm_kbase_track_batch(dev, batch, 0);
+      }
 
       if (has_tiler)
          pthread_mutex_unlock(&dev->submit_lock);

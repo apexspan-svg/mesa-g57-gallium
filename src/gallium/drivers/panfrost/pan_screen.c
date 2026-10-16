@@ -10,6 +10,8 @@
 #include "draw/draw_context.h"
 #include "pipe/p_defines.h"
 #include "pipe/p_screen.h"
+
+#include <stdint.h>
 #include "util/format/u_format.h"
 #include "util/format/u_format_s3tc.h"
 #include "util/os_misc.h"
@@ -980,6 +982,12 @@ panfrost_destroy_screen(struct pipe_screen *pscreen)
    struct panfrost_device *dev = pan_device(pscreen);
    struct panfrost_screen *screen = pan_screen(pscreen);
 
+#ifdef HAVE_PAN_KMOD_KBASE
+   /* Drain in-flight GPU work before tearing the screen down. */
+   if (pan_kbase_jm_is_kbase(dev) &&
+       !pan_kbase_async_seq_done(pan_kbase_async_last_seq()))
+      pan_kbase_async_wait_seq(dev, pan_kbase_async_last_seq(), INT64_MAX);
+#endif
    panfrost_resource_screen_destroy(pscreen);
    panfrost_pool_cleanup(&screen->mempools.bin);
    panfrost_pool_cleanup(&screen->mempools.desc);

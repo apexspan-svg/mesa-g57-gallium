@@ -629,6 +629,12 @@ panfrost_destroy(struct pipe_context *pipe)
    util_dynarray_fini(&panfrost->global_buffers);
 
 #ifdef HAVE_PAN_KMOD_KBASE
+   /* Drain in-flight GPU work before tearing the context down. */
+   if (pan_kbase_jm_is_kbase(dev) &&
+       !pan_kbase_async_seq_done(pan_kbase_async_last_seq()))
+      pan_kbase_async_wait_seq(dev, pan_kbase_async_last_seq(), INT64_MAX);
+#endif
+#ifdef HAVE_PAN_KMOD_KBASE
    if (!pan_kbase_jm_is_kbase(dev)) {
 #endif
    drmSyncobjDestroy(panfrost_device_fd(dev), panfrost->in_sync_obj);

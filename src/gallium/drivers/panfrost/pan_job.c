@@ -6,6 +6,7 @@
  */
 
 #include <assert.h>
+#include <stdint.h>
 
 #include "util/format/u_format.h"
 #include "util/hash_table.h"
@@ -17,6 +18,10 @@
 #include "pan_context.h"
 #include "pan_trace.h"
 #include "pan_util.h"
+
+#ifdef HAVE_PAN_KMOD_KBASE
+#include "pan_kbase_jm.h"
+#endif
 
 #define foreach_batch(ctx, idx)                                                \
    BITSET_FOREACH_SET(idx, ctx->batches.active, PAN_MAX_BATCHES)
@@ -107,6 +112,13 @@ panfrost_batch_cleanup(struct panfrost_context *ctx,
 
    if (ctx->batch == batch)
       ctx->batch = NULL;
+
+#ifdef HAVE_PAN_KMOD_KBASE
+   /* Batch pools die with the batch: drain any GPU work still referencing
+    * them before freeing. No-op when nothing is outstanding. */
+   if (pan_kbase_jm_is_kbase(dev) && !pan_kbase_async_seq_done(pan_kbase_async_last_seq()))
+      pan_kbase_async_wait_seq(dev, pan_kbase_async_last_seq(), INT64_MAX);
+#endif
 
    screen->vtbl.cleanup_batch(batch);
 

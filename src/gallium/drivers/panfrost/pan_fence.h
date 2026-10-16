@@ -13,6 +13,9 @@ struct pipe_fence_handle {
    struct pipe_reference reference;
    uint32_t syncobj;
    bool signaled;
+   /* kbase async submission seq this fence tracks (0 = none / complete).
+    * Only meaningful when PAN_KBASE_ASYNC is on. */
+   uint64_t kbase_seq;
 };
 
 void panfrost_fence_reference(struct pipe_screen *pscreen,

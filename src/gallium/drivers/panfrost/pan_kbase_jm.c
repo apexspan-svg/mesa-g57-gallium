@@ -337,3 +337,174 @@ pan_kbase_jm_submit_batch(struct panfrost_device *dev, uint64_t vtc_jc,
    pthread_mutex_unlock(&submit_mutex);
    return ret;
 }
+
+/* ---- Async engine ---- */
+
+struct kbase_async_bag {
+   bool valid;
+   uint64_t seq;
+   struct base_jd_atom_v2 atoms[2];
+   unsigned nr;
+};
+
+static struct {
+   pthread_mutex_t lock;
+   bool enabled_init;
+   bool enabled;
+   uint64_t seqno;
+   uint64_t completed;
+   struct kbase_async_bag pending;
+} async_state = {
+   .lock = PTHREAD_MUTEX_INITIALIZER,
+};
+
+bool
+pan_kbase_async_enabled(void)
+{
+   if (!async_state.enabled_init) {
+      async_state.enabled_init = true;
+      async_state.enabled = getenv("PAN_KBASE_ASYNC") != NULL;
+   }
+   return async_state.enabled;
+}
+
+uint64_t
+pan_kbase_async_last_seq(void)
+{
+   pthread_mutex_lock(&async_state.lock);
+   uint64_t seq = async_state.seqno;
+   pthread_mutex_unlock(&async_state.lock);
+   return seq;
+}
+
+bool
+pan_kbase_async_seq_done(uint64_t seq)
+{
+   if (seq == 0)
+      return true;
+   pthread_mutex_lock(&async_state.lock);
+   bool done = seq <= async_state.completed;
+   pthread_mutex_unlock(&async_state.lock);
+   return done;
+}
+
+/* Caller must hold async_state.lock. Waits for the pending bag with the
+ * remaining budget; on success retires it. Lock is held across the poll
+ * (event matching is unambiguous: a single bag is ever outstanding). */
+static bool
+wait_pending_locked(struct panfrost_device *dev, int64_t timeout_ns)
+{
+   struct kbase_async_bag *bag = &async_state.pending;
+   int64_t deadline = os_time_get_nano() + timeout_ns;
+
+   for (unsigned i = 0; i < bag->nr; i++) {
+      int64_t remaining = deadline - os_time_get_nano();
+      if (remaining <= 0)
+         return false;
+      int ret =
+         wait_atom(dev->kmod.dev->fd, bag->atoms[i].atom_number, remaining);
+      if (ret) {
+         /* A faulted atom will never complete: retire the bag so later
+          * waits do not spin on it. Completion stays behind, so
+          * dependent waits still report failure via their own path. */
+         async_state.completed = bag->seq;
+         bag->valid = false;
+         return false;
+      }
+   }
+
+   async_state.completed = bag->seq;
+   bag->valid = false;
+   return true;
+}
+
+bool
+pan_kbase_async_wait_seq(struct panfrost_device *dev, uint64_t seq,
+                         int64_t timeout_ns)
+{
+   if (seq == 0)
+      return true;
+
+   pthread_mutex_lock(&async_state.lock);
+   if (seq <= async_state.completed) {
+      pthread_mutex_unlock(&async_state.lock);
+      return true;
+   }
+   if (!async_state.pending.valid) {
+      /* Unknown seq (e.g. submit failed after handing it out — cannot
+       * happen: failures return 0 and record nothing). */
+      pthread_mutex_unlock(&async_state.lock);
+      return false;
+   }
+   /* With one bag outstanding, the pending bag is the newest; waiting for
+    * it completes everything up to and including seq. */
+   bool ok = wait_pending_locked(dev, timeout_ns);
+   pthread_mutex_unlock(&async_state.lock);
+   return ok;
+}
+
+uint64_t
+pan_kbase_async_submit_batch(struct panfrost_device *dev, uint64_t vtc_jc,
+                             uint64_t frag_jc, uint32_t vtc_reqs,
+                             uint32_t frag_reqs)
+{
+   if (!vtc_jc && !frag_jc)
+      return pan_kbase_async_last_seq();
+
+   pthread_mutex_lock(&async_state.lock);
+
+   /* Preserve kernel order: never have two bags in flight. */
+   if (async_state.pending.valid) {
+      if (!wait_pending_locked(dev, 60 * 1000000000ll)) {
+         pthread_mutex_unlock(&async_state.lock);
+         return 0;
+      }
+   }
+
+   struct base_jd_atom_v2 atoms[2];
+   unsigned nr = 0;
+   if (vtc_jc) {
+      atoms[nr] = (struct base_jd_atom_v2){
+         .jc = vtc_jc,
+         .atom_number = alloc_atom(),
+         .core_req = core_req_for(vtc_reqs),
+      };
+      nr++;
+   }
+   if (frag_jc) {
+      atoms[nr] = (struct base_jd_atom_v2){
+         .jc = frag_jc,
+         .core_req = core_req_for(frag_reqs),
+      };
+      atoms[nr].atom_number = alloc_atom();
+      if (nr > 0) {
+         atoms[nr].pre_dep[0].atom_id = atoms[0].atom_number;
+         atoms[nr].pre_dep[0].dependency_type = BASE_JD_DEP_TYPE_ORDER;
+      }
+      nr++;
+   }
+
+   struct kbase_ioctl_job_submit sub = {
+      .addr = (uint64_t)(uintptr_t)&atoms,
+      .nr_atoms = nr,
+      .stride = atom_stride(),
+   };
+
+   int ret = ioctl(dev->kmod.dev->fd, KBASE_IOCTL_JOB_SUBMIT, &sub);
+   if (ret) {
+      mesa_loge("panfrost/kbase: async JOB_SUBMIT failed: %s", strerror(errno));
+      pthread_mutex_unlock(&async_state.lock);
+      return 0;
+   }
+
+   uint64_t seq = ++async_state.seqno;
+   if (seq == 0)
+      seq = ++async_state.seqno; /* keep 0 as "nothing submitted" */
+   async_state.pending.valid = true;
+   async_state.pending.seq = seq;
+   memcpy(async_state.pending.atoms, atoms, sizeof(atoms));
+   async_state.pending.nr = nr;
+
+   pthread_mutex_unlock(&async_state.lock);
+   return seq;
+}

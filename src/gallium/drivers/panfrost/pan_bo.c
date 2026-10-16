@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <xf86drm.h>
 
@@ -128,6 +129,12 @@ panfrost_bo_free(struct panfrost_bo *bo)
 {
    PAN_TRACE_FUNC(PAN_TRACE_GL_BO);
 
+#ifdef HAVE_PAN_KMOD_KBASE
+   /* Never free GPU-busy memory: wait this BO's last writer first. */
+   if (bo->kbase_seq && !pan_kbase_async_seq_done(bo->kbase_seq) && bo->dev)
+      pan_kbase_async_wait_seq(bo->dev, bo->kbase_seq, INT64_MAX);
+#endif
+
    struct pan_kmod_bo *kmod_bo = bo->kmod_bo;
    struct pan_kmod_vm *vm = bo->dev->kmod.vm;
    uint64_t gpu_va = bo->ptr.gpu;
@@ -233,6 +240,15 @@ panfrost_bo_cache_fetch(struct panfrost_device *dev, size_t size,
        * everything newer, so bail. */
       if (!panfrost_bo_wait(entry, dontwait ? 0 : INT64_MAX, true))
          break;
+
+#ifdef HAVE_PAN_KMOD_KBASE
+      /* Same for kbase async work, tracked by submission seq. */
+      if (entry->kbase_seq && !pan_kbase_async_seq_done(entry->kbase_seq)) {
+         if (dontwait)
+            break;
+         pan_kbase_async_wait_seq(dev, entry->kbase_seq, INT64_MAX);
+      }
+#endif
 
       /* This one works, splice it out of the cache */
       list_del(&entry->bucket_link);

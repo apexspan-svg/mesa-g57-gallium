@@ -9,6 +9,7 @@
  */
 
 #include <fcntl.h>
+#include <stdint.h>
 #include <xf86drm.h>
 #include "drm-uapi/drm_fourcc.h"
 
@@ -452,6 +453,13 @@ panfrost_resource_get_handle(struct pipe_screen *pscreen,
          return false;
 
       handle->handle = fd;
+#ifdef HAVE_PAN_KMOD_KBASE
+      /* An exported fd leaves the process (present, cross-API share):
+       * its contents must be complete. */
+      if (pan_kbase_jm_is_kbase(dev) &&
+          !pan_kbase_async_seq_done(pan_kbase_async_last_seq()))
+         pan_kbase_async_wait_seq(dev, pan_kbase_async_last_seq(), INT64_MAX);
+#endif
    } else {
       /* Other handle types not supported */
       return false;
@@ -1572,6 +1580,13 @@ panfrost_ptr_map(struct pipe_context *pctx, struct pipe_resource *resource,
    if ((usage & PIPE_MAP_DIRECTLY) &&
        rsrc->modifier != DRM_FORMAT_MOD_LINEAR)
       return NULL;
+
+#ifdef HAVE_PAN_KMOD_KBASE
+   /* CPU reads must see completed GPU work. */
+   if ((usage & PIPE_MAP_READ) && pan_kbase_jm_is_kbase(dev) &&
+       !pan_kbase_async_seq_done(pan_kbase_async_last_seq()))
+      pan_kbase_async_wait_seq(dev, pan_kbase_async_last_seq(), INT64_MAX);
+#endif
 
    struct panfrost_transfer *transfer = rzalloc(pctx, struct panfrost_transfer);
    transfer->base.level = level;

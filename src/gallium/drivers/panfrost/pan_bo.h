@@ -92,6 +92,10 @@ struct panfrost_bo {
 
    uint32_t flags;
 
+   /* Last async submission seq that wrote this BO (0 = clean). Used to
+    * wait precisely on reuse/free instead of draining the device. */
+   uint64_t kbase_seq;
+
    /* Combination of PAN_BO_ACCESS_{READ,WRITE} flags encoding pending
     * GPU accesses to this BO. Useful to avoid calling the WAIT_BO ioctl
     * when the BO is idle.

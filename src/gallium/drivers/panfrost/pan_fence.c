@@ -16,7 +16,6 @@
 
 #include "util/os_time.h"
 #include "util/u_inlines.h"
-
 #ifdef HAVE_PAN_KMOD_KBASE
 #include "pan_kbase_jm.h"
 #endif
@@ -49,10 +48,24 @@ panfrost_fence_finish(struct pipe_screen *pscreen, struct pipe_context *ctx,
       return true;
 
 #ifdef HAVE_PAN_KMOD_KBASE
-   /* kbase path submits synchronously, so by the time a fence exists the
-    * GPU work is already complete. */
-   if (pan_kbase_jm_is_kbase(dev))
-      return true;
+   /* kbase: without async, submits are synchronous, so by the time a fence
+    * exists the GPU work is already complete. With async, wait for the
+    * tracked submission seq. */
+   if (pan_kbase_jm_is_kbase(dev)) {
+      if (!fence->kbase_seq)
+         return true;
+      uint64_t abs_timeout = os_time_get_absolute_timeout(timeout);
+      if (abs_timeout == OS_TIMEOUT_INFINITE)
+         abs_timeout = INT64_MAX;
+      /* Absolute timeout here is on CLOCK_MONOTONIC; the wait takes
+       * nanoseconds-since-now, so convert (clamped at zero). */
+      int64_t now = os_time_get_nano();
+      int64_t rel = abs_timeout == INT64_MAX ? INT64_MAX :
+         (abs_timeout > (uint64_t)now ? (int64_t)(abs_timeout - now) : 0);
+      fence->signaled =
+         pan_kbase_async_wait_seq(dev, fence->kbase_seq, rel);
+      return fence->signaled;
+   }
 #endif
 
    uint64_t abs_timeout = os_time_get_absolute_timeout(timeout);
@@ -150,7 +163,11 @@ panfrost_fence_create(struct panfrost_context *ctx)
       if (!kf)
          return NULL;
       pipe_reference_init(&kf->reference, 1);
-      kf->signaled = true;
+      /* Synchronous submits are complete by now; async ones track the
+       * last submission seq (seq_done(0) is true: nothing outstanding). */
+      kf->kbase_seq = pan_kbase_async_enabled() ?
+         pan_kbase_async_last_seq() : 0;
+      kf->signaled = pan_kbase_async_seq_done(kf->kbase_seq);
       return kf;
    }
 #endif
