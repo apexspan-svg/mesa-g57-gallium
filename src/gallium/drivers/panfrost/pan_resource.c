@@ -448,9 +448,6 @@ panfrost_resource_get_handle(struct pipe_screen *pscreen,
       handle->handle = panfrost_bo_handle(rsrc->bo);
    } else if (handle->type == WINSYS_HANDLE_TYPE_FD) {
       int fd = panfrost_bo_export(rsrc->bo);
-      fprintf(stderr, "TMPDBG get_handle FD mod=0x%llx -> fd=%d\n",
-              (unsigned long long)rsrc->modifier, fd);
-
       if (fd < 0)
          return false;
 
@@ -1063,8 +1060,6 @@ panfrost_resource_create_with_modifier(struct pipe_screen *screen,
                        pan_kbase_jm_is_kbase(dev);
    if (kbase_raw_fd)
       modifier = DRM_FORMAT_MOD_LINEAR;
-   fprintf(stderr, "TMPDBG rsrc create fmt=0x%x mod=0x%llx raw_fd=%d\n",
-           template->format, (unsigned long long)modifier, (int)kbase_raw_fd);
 #endif
 
    panfrost_resource_setup(screen, so, modifier, template->format, plane_idx);

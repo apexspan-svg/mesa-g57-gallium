@@ -260,8 +260,6 @@ surfaceless_probe_kbase_node(_EGLDisplay *disp)
    if (!dri2_create_screen(disp)) {
       _eglLog(_EGL_WARNING, "surfaceless: failed to create a %s screen on %s",
               dri2_dpy->driver_name, node);
-      fprintf(stderr, "TMPDBG kbase probe: dri2_create_screen FAILED for %s on %s\n",
-              dri2_dpy->driver_name, node);
       free(dri2_dpy->driver_name);
       dri2_dpy->driver_name = NULL;
       close(dri2_dpy->fd_render_gpu);
@@ -269,8 +267,6 @@ surfaceless_probe_kbase_node(_EGLDisplay *disp)
       return false;
    }
 
-   fprintf(stderr, "TMPDBG kbase probe: screen up (%s on %s)\n",
-           dri2_dpy->driver_name, node);
    _eglLog(_EGL_INFO, "surfaceless: %s screen up on %s", dri2_dpy->driver_name, node);
    return true;
 }

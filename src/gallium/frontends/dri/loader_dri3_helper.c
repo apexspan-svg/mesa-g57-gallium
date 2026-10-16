@@ -1458,9 +1458,6 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
    if (!buffer->cpp)
       goto no_image;
 
-   fprintf(stderr, "TMPDBG dri3alloc render==display=%d multiplanes=%d\n",
-           draw->dri_screen_render_gpu == draw->dri_screen_display_gpu,
-           draw->multiplanes_available);
    if (draw->dri_screen_render_gpu == draw->dri_screen_display_gpu) {
       if (draw->multiplanes_available && draw->dri_screen_render_gpu->base.screen->resource_create_with_modifiers) {
          xcb_dri3_get_supported_modifiers_cookie_t mod_cookie;
@@ -1517,8 +1514,6 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
        * the server gave us nothing, and the driver advertises it. */
       {
          const char *termux_wsi = getenv("WSI_X11_TERMUX");
-         fprintf(stderr, "TMPDBG rawforce env=%s modsnull=%d\n",
-                 termux_wsi ? termux_wsi : "(null)", modifiers == NULL);
          /* The server may offer modifiers without 1274 (or none at all)
           * yet still import 1274-marked raw FDs; that is the whole point
           * of the private marker. Override whenever the switch is on and
@@ -1526,7 +1521,6 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
          if (termux_wsi && strcmp(termux_wsi, "0") != 0) {
             uint64_t raw_fd_mod = 1274ull; /* PAN_KBASE_RAW_FD_MODIFIER */
             bool hs = has_supported_modifier(draw, fourcc, &raw_fd_mod, 1);
-            fprintf(stderr, "TMPDBG rawforce has_supported=%d\n", hs);
             if (hs) {
                free(modifiers);
                modifiers = NULL;
@@ -1538,7 +1532,6 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
                }
             }
          }
-         fprintf(stderr, "TMPDBG rawforce use_raw_fd=%d\n", use_raw_fd);
       }
       buffer->image = dri_create_image_with_modifiers(draw->dri_screen_render_gpu,
                                               width, height, format,
@@ -1703,7 +1696,6 @@ dri3_alloc_render_buffer(struct loader_dri3_drawable *draw, unsigned int fourcc,
    if (!check_xcb_error(cookie_pix, "xcb_dri3_pixmap_from_buffer[s]")) {
       if (!tried_plural)
          goto no_buffer_attrib;
-      fprintf(stderr, "TMPDBG dri3 plural rejected, retrying plain\n");
       pixmap = xcb_generate_id(draw->conn);
       cookie_pix = xcb_dri3_pixmap_from_buffer_checked(
          draw->conn, pixmap, draw->drawable, 0,
