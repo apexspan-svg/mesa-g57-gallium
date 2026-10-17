@@ -40,7 +40,10 @@ mesa-panvk-mali-g57 v1.3.0.
   load avg 16-26 typical on this device.
 
 ## Open items (ranked)
-1. FD semaphore import/export (apexspan v1.2.0): real sync_file fences →
+1. Upstream refresh: re-import main snapshot + replay ~80-commit series
+   (base 26.3.0-devel is 2026-10-15; upstream panfrost churns ~15/d incl.
+   Kraid v9 compiler fixes). Bring cadence, not urgency.
+2. FD semaphore import/export (apexspan v1.2.0): real sync_file fences →
    `fence_get_fd` stops returning -1; EGL native fences; cross-process sync;
    prerequisite for async-default + present pacing.
 2. Batch merging across flushes: needs cross-batch dep machinery and a

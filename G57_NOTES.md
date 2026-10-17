@@ -85,6 +85,18 @@ Environment (Dimensity 6300, Android 13, Termux unprivileged):
 - Teardown slowness is intermittent (minutes some runs, prompt others);
   still under investigation, benchmarks unaffected.
 
+## Upstream cadence (Mesa)
+- Base: `26.3.0-devel` snapshot imported 2026-10-15 (squash commit
+  `95465cd`, our kbase series on top — `670e13e` + small follow-ups).
+  That is fresher than latest stable (26.2.5, Oct 14).
+- Upstream panfrost/panvk churn since import: ~15 commits per day, incl.
+  Valhall **Kraid compiler** fixes (v9 = our GPU), `Use full texture
+  handles instead of offsets on v9+` (gallium + panvk), pan/lib bugfixes.
+  We drift daily; a snapshot, not live tracking.
+- Refresh procedure: re-import fresh main snapshot + replay our series.
+  Cadence: weekly or after a big v9 upstream landing — never mid-
+  experiment (would conflate code and thermal deltas).
+
 ## kbase version notes
 - Atom stride is kernel-version dependent (BossDrk, G52/r49: 56 bytes vs
   the usual 64). Default 64 (proven JM 11.38); override
