@@ -30,8 +30,11 @@ Environment (Dimensity 6300, Android 13, Termux unprivileged):
 - Server offers ZERO window modifiers (probed) yet imports 1274-marked
   raw dma-buf FDs (PanVK-proven; the marker is deliberately unadvertised).
 - Server rejects `PixmapFromBuffers` with standard modifiers (BadRequest).
-- Server rejects `xcb_xfixes_create_region` despite advertising XFixes 5.0:
-  damage regions must be optional with full-present fallback.
+- Server rejects `xcb_xfixes_create_region` despite advertising XFixes
+  5.0: damage regions must be optional with full-present fallback. Since
+  `0805e7a` the rejection is cached per drawable — one failed attempt at
+  first swap, then full-window present without per-swap round trips or
+  spew (previously ~7k waste-lines per 30-scene suite).
 - No DRI3 explicit sync on raw path: driver must be GPU-idle before
   queueing the pixmap (true for our synchronous submit).
 - Xvfb `-fbdir` files do NOT reflect SHM-put content; verify windows with
@@ -80,6 +83,11 @@ Environment (Dimensity 6300, Android 13, Termux unprivileged):
   heavy scenes 23-123 FPS. Variance across runs is thermal/load, not code:
   same binaries score differently hot vs cool. Always `taskset -c 6,7`.
 - glxgears: vsync-locked ~60 FPS sustained (swap paced, no errors).
+- DRI3 region-cache A/B (`0805e7a`, build scene, interleaved old/new to
+  cancel heat): old 349/352 vs **new 369/376 → +5.7-7.2%**, new-run-heat
+  handicap included. Present output identical (full-window either way).
+- Suite-wide: 352 on `ca77c8c` (33/33, clean exit) — the prior per-swap
+  region attempts are one source of light-scene cost.
 - SPILL retry never fires on glmark2 (no spilling shaders there) nor on a
   synthetic 8-varying stress shader: dormant as designed, no regressions.
 - Teardown slowness is intermittent (minutes some runs, prompt others);
@@ -104,12 +112,13 @@ Environment (Dimensity 6300, Android 13, Termux unprivileged):
 
 ## Process lessons
 - Verify CI after **every** push. e22ebce + 90bfc4a sat red unnoticed
-  (compile error, not a flake) until a status sweep caught it.
-- This tree stores `pipe_framebuffer_state.cbufs` **by value**
+  (compile error, not a flake) until a status sweep caught it.- This tree stores `pipe_framebuffer_state.cbufs` **by value**
   (`struct pipe_surface cbufs[]`, no pointers): access
   `.cbufs[i].texture` directly.
 - Docs pushes rebuilt both tracks (android ignored only README.md;
   termux had no filter). Both workflows now ignore `**.md`.
+- Redirected stdout is block-buffered: a killed glxgears prints no FPS
+  lines. Read FPS from programs that exit normally (glmark2).
 
 ## Sources
 - HapplyCardo/mesa-Panfork-android `bifrost-g57` (`d8cb29f9`, `4c42d497`).

@@ -7,19 +7,23 @@ mesa-panvk-mali-g57 v1.3.0.
 ## CI
 - Two tracks: `android-gallium-kbase` (NDK zip) + `termux-native-gallium`
   ($PREFIX drop-in tarball). Both auto-run on pushes to main.
-- Last fully green pair: `db260e6`. `ca77c8c`: both green (fix verified);
-  the docs push after it (`1de4579`) triggered nothing — filters work.
+- Last fully green pair: `db260e6`. Also green: `ca77c8c` (cbufs fix) and
+  `0805e7a` (dri3 region cache), both device-verified. Docs pushes after
+  them (`1de4579`, `647c945`, `a4f1014`) triggered nothing.
 - `e22ebce` + `90bfc4a`: were RED (compile error, by-value cbufs), fixed
   in `ca77c8c`. Device regression on `ca77c8c` artifact: EGL textured
   PASS (sync + async); glxgears runs under async, fallback present.
 - Both workflows now skip `**.md`-only pushes.
 
-## Just-landed changes (e22ebce..ca77c8c)
+## Just-landed changes (e22ebce..0805e7a)
 - Display-bound batches (SCANOUT/DISPLAYTARGET/SHARED cbufs) always
   drain-then-submit synchronously: swap/present is correct with or without
   async. Offscreen batches stay async. No dma-fence needed yet.
 - SPILL_NOOPT retry ported (dormant by design; logs when it fires).
 - `PAN_TILER_HEAP_MB=16..2048` (default 128, behavior unchanged).
+- DRI3: CreateRegion rejection cached per drawable (`0805e7a`) — verified
+  on device: exactly one failure, then clean full-window present;
+  interleaved A/B build scene **349/352 → 369/376 (+5.7-7.2%)**.
 - `PORTING_APEXSPAN.md`: complete port inventory (ported/next/skipped).
 
 ## Driver state
