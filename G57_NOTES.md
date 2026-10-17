@@ -16,6 +16,9 @@ Environment (Dimensity 6300, Android 13, Termux unprivileged):
   class from HapplyCardo.
 - v9 `MALLOC_VERTEX` VARYING block: upstream rewrite is sound; textured
   PASS covers the varying path HapplyCardo's bug lived in.
+- Async + display-bound submit gating (`ca77c8c`): EGL textured PASS with
+  `PAN_KBASE_ASYNC=1`; glxgears runs on X11 under async (CreateRegion
+  fallback present, no crash).
 
 ## Loader hooks (all gated, no-op without kbase/MESA_KBASE_NODE)
 - `loader_fd_is_kbase()` (`src/loader/loader.c`): `/proc/self/fd` sniffing
@@ -44,6 +47,11 @@ Environment (Dimensity 6300, Android 13, Termux unprivileged):
   order; event matching unambiguous; 8-bit atom wrap impossible.
 - Fences truthfully signaled (submit blocks). Async port must use `>=`
   seq comparison (HapplyCardo `4c42d497`) and per-BO tracking.
+- Async engine (`PAN_KBASE_ASYNC=1`, opt-in): per-device seq, lazy reap;
+  display-bound batches (SCANOUT/DISPLAYTARGET/SHARED cbufs) drain
+  outstanding async then submit synchronously → present correct by
+  construction, no dma-fences needed. Offscreen batches stay async.
+  Threadless; lock never held across polls.
 
 ## Adopt when relevant
 - AFBC: disable on G57 kbase until proven (`PANVK_NO_AFBC=1` precedent;
@@ -62,6 +70,9 @@ Environment (Dimensity 6300, Android 13, Termux unprivileged):
   Repro: full glmark2; single scene exits clean. Small-BO exits instant.
 - `PAN_KBASE_STATS=1` baseline: ~1.4-1.5ms blocked per batch (includes
   GPU execution under synchronous submit; cf. PanVK 156us driver CPU).
+- Dead X server leaves a stale `X0` socket in `$PREFIX/tmp/.X11-unix`:
+  clients fail "couldn't open display :0" until `termux-x11 :0 &` is
+  re-run. Check `pgrep termux-x11`, not the socket file.
 
 ## Measured (Dimensity 6300, Termux:X11, taskset -c 6,7, 640x480)
 - glmark2 Score: **226**, later **281**, later **421** (vs 143 Zink-on-PanVK),

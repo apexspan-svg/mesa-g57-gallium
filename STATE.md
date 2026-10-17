@@ -7,9 +7,11 @@ mesa-panvk-mali-g57 v1.3.0.
 ## CI
 - Two tracks: `android-gallium-kbase` (NDK zip) + `termux-native-gallium`
   ($PREFIX drop-in tarball). Both auto-run on pushes to main.
-- Last fully green pair: `db260e6`. `e296872`: termux green (android unchecked).
-- `e22ebce` + `90bfc4a`: RED (compile error, by-value cbufs). Fixed in
-  `ca77c8c`; verification watch was running at snapshot time.
+- Last fully green pair: `db260e6`. `ca77c8c`: both green (fix verified);
+  the docs push after it (`1de4579`) triggered nothing — filters work.
+- `e22ebce` + `90bfc4a`: were RED (compile error, by-value cbufs), fixed
+  in `ca77c8c`. Device regression on `ca77c8c` artifact: EGL textured
+  PASS (sync + async); glxgears runs under async, fallback present.
 - Both workflows now skip `**.md`-only pushes.
 
 ## Just-landed changes (e22ebce..ca77c8c)
@@ -51,7 +53,8 @@ mesa-panvk-mali-g57 v1.3.0.
 ## Ops quick reference
 - EGL test: `LD_LIBRARY_PATH=. LIBGL_DRIVERS_PATH=. MESA_KBASE_NODE=/dev/mali0 EGL_LIB=./libEGL_mesa.so ./egl_kbase_textured`
 - GLX test: `DISPLAY=:0 LD_PRELOAD=$HOME/kbase-prefix/lib/libGL.so LD_LIBRARY_PATH=$HOME/kbase-prefix/lib LIBGL_DRIVERS_PATH=$HOME/kbase-prefix/lib/dri WSI_X11_TERMUX=1 glxgears|glmark2`
-- X server: `termux-x11 :0 &` from Termux (app alone insufficient).
+- X server: `termux-x11 :0 &` from Termux (app alone insufficient). Socket
+  can go stale after server death: check `pgrep`, not the socket file.
 - Keep screen awake during benches (Developer options "Stay awake" +
   `termux-wake-lock`) or Doze/thermal skews results.
 - Flags: `PAN_KBASE_ASYNC=1`, `PAN_KBASE_STATS=1`, `PAN_KBASE_ATOM_STRIDE=56|64|72`,
