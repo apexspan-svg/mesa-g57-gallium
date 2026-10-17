@@ -32,6 +32,9 @@
 #include "util/macros.h"
 #include "util/u_debug.h"
 
+/* gallium/kbase: for loader_fd_is_kbase() */
+#include "loader/loader.h"
+
 #include "eglcurrent.h"
 #include "egldevice.h"
 #include "eglglobals.h"
@@ -104,6 +107,12 @@ _eglCheckDeviceHandle(EGLDeviceEXT device)
       cur = cur->Next;
    }
    simple_mtx_unlock(_eglGlobal.Mutex);
+
+   /* gallium/kbase: accept the static kbase device which is not part of the
+    * device list. */
+   if (device == (EGLDeviceEXT)&_eglKbaseDevice)
+      return EGL_TRUE;
+
    return (cur != NULL);
 }
 
@@ -112,6 +121,17 @@ _EGLDevice _eglSoftwareDevice = {
    .extensions = "EGL_MESA_device_software EGL_EXT_device_drm_render_node EGL_EXT_device_type",
    .MESA_device_software = EGL_TRUE,
    .EXT_device_drm_render_node = EGL_TRUE,
+   .EXT_device_type = EGL_TRUE,
+};
+
+/* gallium/kbase: kbase device nodes (e.g. /dev/mali0) are not DRM devices, so
+ * they never appear in the drm device enumeration and there is no drmDevice
+ * to construct an EGLDevice from.  Hardware displays backed by kbase resolve
+ * to this static device instead of failing outright.  It deliberately stays
+ * out of the global device list (_eglFiniDevice assumes list members are
+ * DRM devices). */
+static _EGLDevice _eglKbaseDevice = {
+   .extensions = "EGL_EXT_device_type",
    .EXT_device_type = EGL_TRUE,
 };
 
@@ -200,6 +220,14 @@ _eglFindDevice(int fd, bool software)
    assert(_eglDeviceSupports(dev, _EGL_DEVICE_SOFTWARE));
    if (software)
       goto out;
+
+   /* gallium/kbase: kbase device nodes are not DRM nodes; there is nothing
+    * for drmGetDevice2 to match, so serve them with the static kbase
+    * device instead of failing hardware displays outright. */
+   if (loader_fd_is_kbase(fd)) {
+      dev = &_eglKbaseDevice;
+      goto out;
+   }
 
 #ifdef HAVE_LIBDRM
    drmDevicePtr device;

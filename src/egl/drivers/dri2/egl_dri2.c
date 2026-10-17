@@ -861,6 +861,10 @@ dri2_setup_device(_EGLDisplay *disp, EGLBoolean software)
       render_fd = -1;
    } else if (loader_is_device_render_capable(dri2_dpy->fd_render_gpu)) {
       render_fd = dri2_dpy->fd_render_gpu;
+   } else if (loader_fd_is_kbase(dri2_dpy->fd_render_gpu)) {
+      /* gallium/kbase: the kbase fd (e.g. /dev/mali0) is the device itself;
+       * there is no DRM render node to negotiate with. */
+      render_fd = dri2_dpy->fd_render_gpu;
    } else {
       render_fd = dri_query_compatible_render_only_device_fd(
          dri2_dpy->fd_render_gpu);
