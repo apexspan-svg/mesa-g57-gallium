@@ -127,8 +127,12 @@ driCreateNewScreen3(int scrn, int fd,
 
    (void) mtx_init(&screen->opencl_func_mutex, mtx_plain);
 
-   struct pipe_screen *pscreen = NULL;
-   switch (type) {
+/* gallium/kbase: EGL-x11 DRI3 failed silently here on kbase
+ * (driCreateNewScreen3 == NULL) — log which stage died. */
+#include "util/log.h"
+
+struct pipe_screen *pscreen = NULL;
+    switch (type) {
    case DRI_SCREEN_DRI3:
       pscreen = dri2_init_screen(screen, driver_name_is_inferred);
       break;
@@ -145,11 +149,15 @@ driCreateNewScreen3(int scrn, int fd,
       UNREACHABLE("unknown dri screen type");
    }
    if (pscreen == NULL) {
+      mesa_loge("dri: CreateNewScreen3 FAILED at pscreen creation (type=%d)",
+                (int)type);
       dri_destroy_screen(screen);
       return NULL;
    }
    *driver_configs = dri_init_screen(screen, pscreen, has_multibuffer);
    if (*driver_configs == NULL) {
+      mesa_loge("dri: CreateNewScreen3 FAILED at config creation (type=%d)",
+                (int)type);
       dri_destroy_screen(screen);
       return NULL;
    }

@@ -33,6 +33,9 @@
 #include "dri_context.h"
 #include "dri_helpers.h"
 
+/* gallium/kbase config-failure diagnostics */
+#include "util/log.h"
+
 #include "util/u_inlines.h"
 #include "pipe/p_screen.h"
 #include "util/format/u_formats.h"
@@ -468,7 +471,7 @@ dri_fill_in_modes(struct dri_screen *screen)
    }
 
    if (configs == NULL) {
-      debug_printf("%s: driCreateConfigs failed\n", __func__);
+      mesa_loge("dri: driCreateConfigs FAILED (no configs after format filters)");
       return NULL;
    }
 
