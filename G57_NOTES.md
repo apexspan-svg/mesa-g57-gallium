@@ -78,10 +78,13 @@ Environment (Dimensity 6300, Android 13, Termux unprivileged):
   re-run. Check `pgrep termux-x11`, not the socket file.
 
 ## Measured (Dimensity 6300, Termux:X11, taskset -c 6,7, 640x480)
-- glmark2 Score: **226**, later **281**, later **421** (vs 143 Zink-on-PanVK),
-  all scenes complete, no crashes. Scene range now ~370-600 FPS light,
-  heavy scenes 23-123 FPS. Variance across runs is thermal/load, not code:
-  same binaries score differently hot vs cool. Always `taskset -c 6,7`.
+- glmark2 Score: **226**, later **281**, later **421**, later **352**
+  (hot — straight after a prior full suite + A/B runs), later **390**
+  with the region-cache fix under equal-or-worse heat — all scenes
+  complete, no crashes. Scene range ~538 top / 23 bottom. Variance across runs is thermal/load,
+  not code: same binaries score differently hot vs cool. Always
+  `taskset -c 6,7`. Suite stderr is ~11KB since the region fix
+  (was 12MB).
 - glxgears: vsync-locked ~60 FPS sustained (swap paced, no errors).
 - DRI3 region-cache A/B (`0805e7a`, build scene, interleaved old/new to
   cancel heat): old 349/352 vs **new 369/376 → +5.7-7.2%**, new-run-heat

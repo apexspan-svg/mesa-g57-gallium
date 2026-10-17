@@ -34,7 +34,9 @@ mesa-panvk-mali-g57 v1.3.0.
 - Teardown/failure paths log named causes.
 
 ## Numbers (taskset -c 6,7, 640x480, Termux:X11)
-- glmark2 full: **226 → 281 → 421** (same binaries; spread is thermal/load).
+- glmark2 full: **226 → 281 → 421 → 352 → 390** (same binaries modulo
+  the region-cache fix; spread is thermal/load). 390 ran on `0805e7a`
+  right after sustained load; suite stderr now ~11KB (was 12MB).
 - glmark2 terrain: 21-27 cool-ish, 15-17 hot; resolution-invariant →
   vertex/tiler-bound. llvmpipe 2 FPS.
 - glxgears: 60 locked (vsync) / 350-660 unpaced (llvmpipe 124-150).
