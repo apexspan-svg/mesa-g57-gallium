@@ -94,6 +94,17 @@ _eglFiniDevice(void)
    _eglGlobal.DeviceList = NULL;
 }
 
+/* gallium/kbase: kbase device nodes (e.g. /dev/mali0) are not DRM devices, so
+ * they never appear in the drm device enumeration and there is no drmDevice
+ * to construct an EGLDevice from.  Hardware displays backed by kbase resolve
+ * to this static device instead of failing outright.  It deliberately stays
+ * out of the global device list (_eglFiniDevice assumes list members are
+ * DRM devices). */
+static _EGLDevice _eglKbaseDevice = {
+   .extensions = "EGL_EXT_device_type",
+   .EXT_device_type = EGL_TRUE,
+};
+
 EGLBoolean
 _eglCheckDeviceHandle(EGLDeviceEXT device)
 {
@@ -121,17 +132,6 @@ _EGLDevice _eglSoftwareDevice = {
    .extensions = "EGL_MESA_device_software EGL_EXT_device_drm_render_node EGL_EXT_device_type",
    .MESA_device_software = EGL_TRUE,
    .EXT_device_drm_render_node = EGL_TRUE,
-   .EXT_device_type = EGL_TRUE,
-};
-
-/* gallium/kbase: kbase device nodes (e.g. /dev/mali0) are not DRM devices, so
- * they never appear in the drm device enumeration and there is no drmDevice
- * to construct an EGLDevice from.  Hardware displays backed by kbase resolve
- * to this static device instead of failing outright.  It deliberately stays
- * out of the global device list (_eglFiniDevice assumes list members are
- * DRM devices). */
-static _EGLDevice _eglKbaseDevice = {
-   .extensions = "EGL_EXT_device_type",
    .EXT_device_type = EGL_TRUE,
 };
 
