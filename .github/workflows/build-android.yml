@@ -9,6 +9,7 @@ on:
       - '.github/workflows/probe-termux-docker.yml'
       - '.github/run-in-termux.sh'
       - 'README.md'
+      - '**.md'
       - 'G57_NOTES.md'
       - 'tests/**'
 

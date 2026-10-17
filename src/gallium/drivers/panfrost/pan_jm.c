@@ -237,11 +237,11 @@ static bool
 jm_batch_targets_display(struct panfrost_batch *batch)
 {
    for (unsigned i = 0; i < batch->key.nr_cbufs; i++) {
-      struct pipe_surface *surf = batch->key.cbufs[i];
-      if (surf && surf->texture &&
-          (surf->texture->bind & (PIPE_BIND_SCANOUT |
-                                  PIPE_BIND_DISPLAY_TARGET |
-                                  PIPE_BIND_SHARED)))
+      /* cbufs[] holds surfaces by value in this tree */
+      struct pipe_resource *tex = batch->key.cbufs[i].texture;
+      if (tex && (tex->bind & (PIPE_BIND_SCANOUT |
+                               PIPE_BIND_DISPLAY_TARGET |
+                               PIPE_BIND_SHARED)))
          return true;
    }
    return false;

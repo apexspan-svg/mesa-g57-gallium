@@ -79,6 +79,15 @@ Environment (Dimensity 6300, Android 13, Termux unprivileged):
   the usual 64). Default 64 (proven JM 11.38); override
   `PAN_KBASE_ATOM_STRIDE=56|64|72`; FristOneRR auto-detects.
 
+## Process lessons
+- Verify CI after **every** push. e22ebce + 90bfc4a sat red unnoticed
+  (compile error, not a flake) until a status sweep caught it.
+- This tree stores `pipe_framebuffer_state.cbufs` **by value**
+  (`struct pipe_surface cbufs[]`, no pointers): access
+  `.cbufs[i].texture` directly.
+- Docs pushes rebuilt both tracks (android ignored only README.md;
+  termux had no filter). Both workflows now ignore `**.md`.
+
 ## Sources
 - HapplyCardo/mesa-Panfork-android `bifrost-g57` (`d8cb29f9`, `4c42d497`).
 - JimVulkan/mali-panfrost: traced `core_req`, async/event design.
