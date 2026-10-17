@@ -50,6 +50,7 @@
 #include "main/framebuffer.h"
 #include "main/version.h"
 #include "main/debug_output.h"
+#include "util/log.h"
 #include "main/errors.h"
 #include "loader/loader.h"
 #include "mesa_interface.h"
@@ -127,12 +128,8 @@ driCreateNewScreen3(int scrn, int fd,
 
    (void) mtx_init(&screen->opencl_func_mutex, mtx_plain);
 
-/* gallium/kbase: EGL-x11 DRI3 failed silently here on kbase
- * (driCreateNewScreen3 == NULL) — log which stage died. */
-#include "util/log.h"
-
-struct pipe_screen *pscreen = NULL;
-    switch (type) {
+   struct pipe_screen *pscreen = NULL;
+   switch (type) {
    case DRI_SCREEN_DRI3:
       pscreen = dri2_init_screen(screen, driver_name_is_inferred);
       break;
