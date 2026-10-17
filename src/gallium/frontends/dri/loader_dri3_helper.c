@@ -403,6 +403,7 @@ loader_dri3_drawable_init(xcb_connection_t *conn,
    draw->drawable = drawable;
    draw->type = type;
    draw->region = 0;
+   draw->region_rejected = false;
    draw->dri_screen_render_gpu = dri_screen_render_gpu;
    draw->dri_screen_display_gpu = dri_screen_display_gpu;
    draw->multiplanes_available = multiplanes_available;
@@ -1168,15 +1169,18 @@ loader_dri3_swap_buffers_msc(struct loader_dri3_drawable *draw,
       back->busy = 1;
       back->last_swap = draw->send_sbc;
 
-      if (!draw->region) {
+      if (!draw->region && !draw->region_rejected) {
          draw->region = xcb_generate_id(draw->conn);
          /* Some servers (e.g. Termux:X11) advertise XFixes but reject
-          * region creation. Fall back to full-window present (region 0)
-          * instead of dying on the unchecked error later. */
+          * region creation once and forever. Cache the rejection and
+          * fall back to full-window present (region 0) for the drawable's
+          * lifetime instead of re-failing (and re-spewing) every swap. */
          xcb_void_cookie_t rc = xcb_xfixes_create_region_checked(
             draw->conn, draw->region, 0, NULL);
-         if (!check_xcb_error(rc, "xcb_xfixes_create_region"))
+         if (!check_xcb_error(rc, "xcb_xfixes_create_region")) {
             draw->region = 0;
+            draw->region_rejected = true;
+         }
       }
 
       xcb_xfixes_region_t region = 0;

@@ -120,6 +120,10 @@ struct loader_dri3_drawable {
    xcb_drawable_t drawable;
    xcb_window_t window;
    xcb_xfixes_region_t region;
+   /* Set once the server rejects region creation. Keeps us from retrying
+    * (and respewing errors) on every swap: full-window present from then
+    * on, identical output, minus a failed round trip per frame. */
+   bool region_rejected;
    int width;
    int height;
    int depth;
