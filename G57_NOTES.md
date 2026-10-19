@@ -78,7 +78,22 @@ Environment (Dimensity 6300, Android 13, Termux unprivileged):
   storage blocks. Missing: GS, tessellation, compute work groups.
 
 ## Chromium / ANGLE on kbase (the GPU-process respawn loop)
-- Symptom: chromium's GPU process dies at once with
+- **Status 2026-10-19: WebGL 2.0 runs in chromium on our driver** — context
+  created on "Mali-G57 MC2 (Panfrost)", no GPU-process respawn loop, 27-55
+  fps in the page's rAF loop. Two driver bugs remain (see "open gaps"):
+  a second context on the same screen crashes, and the default framebuffer
+  has no read buffer.
+- Working invocation: `--use-gl=angle --use-angle=gles` (ANGLE's **ES**
+  backend). `--use-angle=gl` (desktop GL) cannot work: chromium asks for
+  `EGL_PLATFORM_ANGLE_TYPE_OPENGL_ANGLE`, and ANGLE's desktop ladder is
+  core 4.5→3.2 then legacy 3.3 — all of which need a geometry shader,
+  which panfrost does not implement (our ceiling is desktop GL 3.1).
+  ANGLE only falls back to ES for the *default* platform type, so with
+  `--use-angle=gl` the ES entries are never tried and every attempt
+  fails with "Could not create a backing OpenGL context".
+  (`PAN_MESA_DEBUG=gl3` gives a GL 3.2 core context, but then WebGL
+  context creation fails outright.)
+- Symptom of the old failure: chromium's GPU process exits at once with
   `ANGLE Display::initialize error 12289: Could not create a backing OpenGL
   context` → `eglInitialize OpenGL failed with error EGL_NOT_INITIALIZED`
   → `Exiting GPU process due to errors during initialization`; the browser
@@ -87,7 +102,7 @@ Environment (Dimensity 6300, Android 13, Termux unprivileged):
   backend** (`libANGLE/renderer/gl/glx/DisplayGLX.cpp`), *not* our EGL.
   Every EGL-side fix (kopper, DRI3, the kbase EGLDevice) is therefore
   irrelevant to this failure — the *client-side GLX FBConfig list* is
-  what ANGLE consumes. Our EGL path was innocent the whole time.
+  what ANGLE consumes.
 - ANGLE's FBConfig query (exact list in DisplayGLX.cpp) demands RGBA8 +
   depth 24 + stencil 8 + doublebuffer + WINDOW|PBUFFER|PIXMAP +
   X_RENDERABLE + **GLX_CONFIG_CAVEAT == GLX_NONE**.
@@ -98,32 +113,45 @@ Environment (Dimensity 6300, Android 13, Termux unprivileged):
   the X11 `None` (0). So "no caveat" is **0x8000**, not 0. A probe that
   asks for caveat 0 gets *zero* configs and looks like a driver bug; the
   same query with 0x8000 returns **28** configs. Our configs report
-  0x8000, i.e. "no caveat" ✓.
-- The remaining blocker is **ANGLE's context creation**, not the config
-  query: ANGLE's ladder is desktop core 4.5→3.2, desktop legacy 3.3,
-  then ES 3.2→2.0. Standalone on the device, that ladder ends at
-  **ES 3.1** ("OpenGL ES 3.1 Mesa 26.3.0-devel", renderer "Mali-G57 MC2
-  (Panfrost)") with pbuffer + makeCurrent ✓ — so our driver *can*
-  satisfy ANGLE; inside chromium's GPU process every attempt fails and
-  ANGLE reports "Could not create a backing OpenGL context".
+  0x8000, i.e. "no caveat" ✓ — the query was never the problem.
 - Our GLX creates the context client-side and then asks the X server to
-  register it (`xcb_glx_create_context_attribs_arb_checked`); if the
-  server rejects that request the client destroys the context and
-  returns NULL. The Termux:X11 server's GLX is a software
-  implementation, so this hand-shake is a prime suspect (X error
-  `GLXBadFBConfig` = 165 is what the server replies).
-- Bisecting ANGLE's attribute list (`~/kbase-test/glx_attr_bisect.c`:
-  full list, then the list minus one attribute at a time, then each
-  attribute alone) is the fastest way to name a failing GLX query
-  requirement — but check the constant values first (see the trap
-  above).
+  register it (`xcb_glx_create_context_attribs_arb_checked`); the server
+  replies `GLXBadFBConfig` (165) for the versions we cannot satisfy —
+  that error is *ours* (client-side `__glXSendError`), not the server's.
+- The remaining blocker is **ANGLE's context creation**, not the config
+  query. Standalone on the device, ANGLE's whole ladder succeeds at
+  **ES 3.1** ("OpenGL ES 3.1 Mesa 26.3.0-devel", renderer "Mali-G57 MC2
+  (Panfrost)") with pbuffer + makeCurrent ✓.
 - Repro without chromium: `~/kbase-test/glx_angle_probe.c` (ANGLE's
   exact init: FBConfig query + the whole context ladder), `glx_ctx_matrix.c`
-  (context creation for every candidate config), `glx_cfg_dump.c`
-  (per-config attribute dump), `glx_es_probe.c`, `glx_cap_probe.c`.
-  Note: in the probe, declare `glXChooseFBConfig` as returning
-  `GLXFBConfig *` — an `int` return truncates the pointer and the
-  "crash" is your own bug, not the driver's.
+  (context creation for every candidate config), `glx_es_draw.c` (ES 3.1
+  draw via GLX), `glx_es_share.c` (second/shared context — **crashes**),
+  `glx_cfg_dump.c` (per-config attribute dump), `glx_es_probe.c`,
+  `glx_cap_probe.c`. Note: in a probe, declare `glXChooseFBConfig` as
+  returning `GLXFBConfig *` — an `int` return truncates the pointer and
+  the "crash" is your own bug, not the driver's.
+
+## Open gaps (driver bugs found 2026-10-19)
+1. **A second context on the same screen crashes.** Creating a second
+   GLX context (shared *or* not) and then calling `glXMakeCurrent` on the
+   first one SIGSEGVs inside libGL. Chromium's GPU process needs exactly
+   this (compositor context + ANGLE context + WebGL context), so it is
+   the blocker for the canvas being sampled. Reproducer:
+   `~/kbase-test/glx_es_noshare.c` (crashes at the `glXMakeCurrent`
+   after the second `glXCreateContextAttribsARB`). Needs a `-g` build to
+   pinpoint the faulting function (the release build's unwind points at
+   `__glxGetMscRate`, i.e. the frame is bogus).
+2. **The default framebuffer has no read buffer.** `glReadPixels` on the
+   default framebuffer fails with
+   `glReadPixels(GL_IMPLEMENTATION_COLOR_READ_FORMAT: no GL_READ_BUFFER)`
+   → INVALID_OPERATION. FBO rendering and FBO readback are fine
+   (`glx_es_draw.c`: FBO draw + readback returns the cleared pixel), so
+   the default (window/pbuffer) surface's framebuffer state is the odd
+   one out. Mesa sets `_ColorReadBufferIndex` in
+   `_mesa_initialize_window_framebuffer()` (BUFFER_BACK_LEFT for
+   double-buffered) and clears `_ColorReadBuffer` when the fb is
+   0×0 or the index is BUFFER_NONE.
+
 - ANGLE's context ladder (`GenerateContextCreationToTry`): desktop core
   4.5→3.2, desktop legacy 3.3, then ES 3.2→2.0. Its GL backend also
   refuses desktop GL < 3.2 ("Desktop GL below 3.2 is not supported"), and
