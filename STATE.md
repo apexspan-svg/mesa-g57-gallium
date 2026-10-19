@@ -5,15 +5,17 @@ Gallium panfrost on kbase (`/dev/mali0`), forked from apexspan
 mesa-panvk-mali-g57 v1.3.0.
 
 ## CI
-- Two tracks: `android-gallium-kbase` (NDK zip) + `termux-native-gallium`
-  ($PREFIX drop-in tarball). Both auto-run on pushes to main.
-- Last fully green pair: `db260e6`. Also green: `ca77c8c` (cbufs fix) and
-  `0805e7a` (dri3 region cache), both device-verified. Docs pushes after
-  them (`1de4579`, `647c945`, `a4f1014`) triggered nothing.
-- `e22ebce` + `90bfc4a`: were RED (compile error, by-value cbufs), fixed
-  in `ca77c8c`. Device regression on `ca77c8c` artifact: EGL textured
-  PASS (sync + async); glxgears runs under async, fallback present.
-- Both workflows now skip `**.md`-only pushes.
+- **One push-triggered track: `termux-native-gallium`** ($PREFIX drop-in
+  tarball). The NDK track (`android-gallium-kbase`) was dropped in
+  `fbada26` — it competed for the same runner capacity and left the
+  termux builds queued; the termux artifact is the one that runs on the
+  device. The NDK workflow can be restored from git history if needed.
+- `probe-termux-docker` is manual-dispatch only.
+- Both workflows skip `**.md`-only pushes.
+- Last fully green pair: `6b522f1` (termux + android). Also green:
+  `913de89` (stage markers), `7b17dda` (EGL device fix), `ca77c8c`,
+  `0805e7a`. Red runs seen and fixed: `e22ebce`/`90bfc4a` (compile
+  error), `e3c111c` (declaration order).
 
 ## Just-landed changes (e22ebce..0805e7a)
 - Display-bound batches (SCANOUT/DISPLAYTARGET/SHARED cbufs) always
@@ -32,6 +34,22 @@ mesa-panvk-mali-g57 v1.3.0.
 - Present: exportable BOs (AHB on unrooted MTK) + DRI3 raw-FD modifier
   1274 under `WSI_X11_TERMUX=1`; plain-Pixmap retry; full-window fallback.
 - Teardown/failure paths log named causes.
+
+## Chromium on kbase (in flight)
+- Root-caused the GPU-process respawn loop: with `--use-angle=gl` ANGLE
+  uses its **native GLX backend**, and it needs `GLX_CONFIG_CAVEAT ==
+  GLX_NONE`; the Termux:X11 server's software GLX rates every config
+  `GLX_SLOW_CONFIG` and `createDriMode()` copied that rating into the
+  client list → zero FBConfigs → `eglInitialize` EGL_NOT_INITIALIZED.
+- Fix: `987fd25` (upgrade SLOW → NONE for configs we render on the GPU).
+- Driver desktop-GL ceiling: **3.1 compat** by default, **3.2 core** with
+  `PAN_MESA_DEBUG=gl3`; 4.x would need geometry + tessellation shaders in
+  panfrost. ANGLE lands on **ES 3.1** (ANGLE's ES backend) — the good
+  path for WebGL on Mali.
+- Repro without chromium: `~/kbase-test/glx_angle_probe.c` (ANGLE's exact
+  init), `glx_attr_bisect.c` (names the offending attribute),
+  `glx_cfg_dump.c` (per-config attribute dump), `glx_es_probe.c`,
+  `glx_cap_probe.c`.
 
 ## Numbers (taskset -c 6,7, 640x480, Termux:X11)
 - glmark2 full: **226 → 281 → 421 → 352 → 390** (same binaries modulo

@@ -12,9 +12,16 @@ on:
     paths-ignore:
       - '**.md'
 
+# Only ever build the newest push: the arm64 hosted-runner pool is a
+# public-preview pool with limited capacity, so stale queued runs would
+# otherwise sit in front of the build we actually want.
+concurrency:
+  group: termux-native-gallium-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-22.04-arm
     timeout-minutes: 300
     container:
       image: termux/termux-docker:aarch64@sha256:d9e15c9751ed0e5d436ca32f97bf02b670cc004df4b01b7bfd8d145a84ba0575
