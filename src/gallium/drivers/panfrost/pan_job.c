@@ -790,7 +790,8 @@ panfrost_clean_written_textures(struct panfrost_context *ctx)
       if (!prsrc->bo || !prsrc->bo->kmod_bo)
          continue;
 
-      pan_kmod_bo_clean_gpu_cache(prsrc->bo->kmod_bo, prsrc->base.size);
+      pan_kmod_bo_clean_gpu_cache(prsrc->bo->kmod_bo,
+                                prsrc->bo->kmod_bo->size);
    }
 }
 
