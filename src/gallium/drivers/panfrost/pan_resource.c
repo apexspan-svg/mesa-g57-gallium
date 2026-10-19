@@ -10,6 +10,7 @@
 
 #include <fcntl.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <xf86drm.h>
 #include "drm-uapi/drm_fourcc.h"
 
@@ -1071,6 +1072,18 @@ panfrost_resource_create_with_modifier(struct pipe_screen *screen,
 #endif
 
    panfrost_resource_setup(screen, so, modifier, template->format, plane_idx);
+
+   /* TEMPORARY diagnostic: identify the backing BO of every resource so a
+    * cross-context sharing bug (a texture created in one GL context being
+    * invisible in another) can be told apart from a cache-coherency bug. */
+   {
+      uint32_t handle = 0;
+      if (so->bo && so->bo->kmod_bo)
+         handle = so->bo->kmod_bo->handle;
+      fprintf(stderr, "PANDBG: resource=%p bo_handle=%u size=%llu width=%u height=%u\n",
+              (void *)so, handle, (unsigned long long)so->base.width0 * 4,
+              so->base.width0, so->base.height0);
+   }
 
 #ifdef HAVE_PAN_KMOD_KBASE
    if (kbase_raw_fd)
