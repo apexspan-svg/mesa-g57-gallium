@@ -56,6 +56,73 @@ Environment (Dimensity 6300, Android 13, Termux unprivileged):
   construction, no dma-fences needed. Offscreen batches stay async.
   Threadless; lock never held across polls.
 
+## Desktop GL version ceiling (measured 2026-10-19)
+- Default build exposes **desktop GL 3.1 compat** (GLSL 1.40) and **GL ES
+  3.1**; `GL_VERSION=3.1 Mesa 26.3.0-devel`, `GL_RENDERER=Mali-G57 MC2
+  (Panfrost)`.
+- `PAN_MESA_DEBUG=gl3` (fork's "experimental GL 3.x implementation, up to
+  3.3", `pan_screen.c:816` — `caps->glsl_feature_level = is_gl3 ? 330 :
+  140`) lifts the desktop side to **GL 3.2 core** (GLSL 150) and exposes
+  `MAX_VERTEX_OUTPUT_COMPONENTS=128`. 4.x is not reachable: desktop GL
+  3.2+ mandates a geometry shader and 4.0 tessellation, and panfrost
+  implements neither (`MAX_GEOMETRY_SHADER_INVOCATIONS`,
+  `MAX_PATCH_VERTICES` unsupported) — a driver-feature gap, not a kbase
+  hardware limit.
+- Consequence for ANGLE: the **ES 3.1** path is the good one (ANGLE's ES
+  backend, ESSL→ESSL). Forcing desktop GL (the `gl3` flag) would push
+  ANGLE onto its GL backend (ESSL→GLSL 150 + emulating ES features
+  desktop GL 3.2 lacks) — slower and feature-poorer. Keep `gl3` off for
+  Chromium; it is a desktop-app convenience.
+- Caps present at 3.1: uniform blocks (15/66/105), 16 vertex attribs, 32
+  texture image units, 8 draw buffers, 8 samples, 128 TF attribs, 8 shader
+  storage blocks. Missing: GS, tessellation, compute work groups.
+
+## Chromium / ANGLE on kbase (the GPU-process respawn loop)
+- Symptom: chromium's GPU process dies at once with
+  `ANGLE Display::initialize error 12289: Could not create a backing OpenGL
+  context` → `eglInitialize OpenGL failed with error EGL_NOT_INITIALIZED`
+  → `Exiting GPU process due to errors during initialization`; the browser
+  respawns it in a loop and falls back to software (~1 fps).
+- Decisive fact: with `--use-angle=gl` ANGLE uses its **native GLX
+  backend** (`libANGLE/renderer/gl/glx/DisplayGLX.cpp`), *not* our EGL.
+  Every EGL-side fix (kopper, DRI3, the kbase EGLDevice) is therefore
+  irrelevant to this failure — the *client-side GLX FBConfig list* is
+  what ANGLE consumes. Our EGL path was innocent the whole time.
+- ANGLE's FBConfig query (exact list in DisplayGLX.cpp) demands RGBA8 +
+  depth 24 + stencil 8 + doublebuffer + WINDOW|PBUFFER|PIXMAP +
+  X_RENDERABLE + **GLX_CONFIG_CAVEAT == GLX_NONE**.
+- Our `dri_util.c` reported `__DRI_ATTRIB_SLOW_BIT` for every config that
+  carries an accumulation buffer; `fbconfigs_compatible()` maps that to
+  GLX_SLOW_CONFIG (0x8000), so ANGLE's `GLX_NONE` request rejected
+  *every* config → "Could not find a decent GLX FBConfig to create the
+  context." → EGL_NOT_INITIALIZED. Fix (`6b522f1`): report caveat 0 —
+  the kbase device is a hardware accelerator (upstream Mesa reports 0
+  here too).
+- ANGLE's context ladder (`GenerateContextCreationToTry`): desktop core
+  4.5→3.2, desktop legacy 3.3, then ES 3.2→2.0. Its GL backend also
+  refuses desktop GL < 3.2 ("Desktop GL below 3.2 is not supported"), and
+  our tree tops out at GL 3.1 *compat* → ANGLE has to land on an ES
+  context, which our GLX supports (`GLX_CONTEXT_ES_PROFILE_BIT_EXT` maps
+  to `__DRI_API_GLES2/3`). Measured on device: our GLX creates **GL ES
+  3.1** (`GL_RENDERER = Mali-G57 MC2 (Panfrost)`, "OpenGL ES 3.1 Mesa
+  26.3.0-devel") with a 1x1 pbuffer + makeCurrent; ES 3.2 is refused
+  (GLXBadFBConfig) and desktop core ≥3.2 is refused (EGL_BAD_MATCH on the
+  EGL side). So ANGLE runs its **ES backend** on kbase — the WebGL
+  translation tax applies, but the GPU work is ours.
+- Reproducer without chromium: `~/kbase-test/glx_angle_probe.c` replays
+  ANGLE's init verbatim (its exact FBConfig attribute list, then its
+  context ladder) — the cheapest way to test this class of bug; the
+  `glx_cfg_dump.c` companion dumps every config attribute (n, caveat,
+  stencil, drawable bits) when a query returns nothing.
+- Debugging lessons: chromium's message names "backing OpenGL context",
+  never the FBConfig attribute that failed, so the failing requirement
+  has to be reconstructed from ANGLE's source. `--gpu-launcher=` is a
+  **no-op** in this build (155) — a wrapper script never ran. The GPU
+  child has no `DISPLAY` in its env (ozone shares the X connection over
+  mojo), so DISPLAY is not the missing piece. `MESA-LOADER: failed to
+  retrieve device information` in the GPU process is expected on kbase
+  (no DRM device) and harmless.
+
 ## Adopt when relevant
 - AFBC: disable on G57 kbase until proven (`PANVK_NO_AFBC=1` precedent;
   `PAN_BASE_QUIRK_NO_AFBC`). Suspect for any future `DATA_INVALID_FAULT`

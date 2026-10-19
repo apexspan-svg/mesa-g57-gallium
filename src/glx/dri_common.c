@@ -207,6 +207,21 @@ createDriMode(struct glx_config *config, const struct dri_config **driConfigs)
    driConfig->base = *config;
    driConfig->driConfig = driConfigs[i];
 
+   /* The X server's GLX is frequently a software implementation (the
+    * Termux:X11 server has no GPU GLX), and it then rates every one of
+    * its configs GLX_SLOW_CONFIG.  That rating describes the *server's*
+    * implementation, but this config is backed by one of our DRI configs
+    * and is rendered by us, on the GPU -- so it is not slow.  Report
+    * GLX_NONE, otherwise clients that require
+    * GLX_CONFIG_CAVEAT == GLX_NONE (ANGLE's native-GL backend does) find
+    * no usable config at all and fail to initialize with
+    * "Could not create a backing OpenGL context".
+    *
+    * A NON_CONFORMANT rating is kept: that flags a real conformance gap
+    * rather than a missing accelerator. */
+   if (driConfig->base.visualRating == GLX_SLOW_CONFIG)
+      driConfig->base.visualRating = GLX_NONE;
+
    return &driConfig->base;
 }
 
