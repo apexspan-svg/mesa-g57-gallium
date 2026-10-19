@@ -132,16 +132,7 @@ Environment (Dimensity 6300, Android 13, Termux unprivileged):
   the "crash" is your own bug, not the driver's.
 
 ## Open gaps (driver bugs found 2026-10-19)
-1. **A second context on the same screen crashes.** Creating a second
-   GLX context (shared *or* not) and then calling `glXMakeCurrent` on the
-   first one SIGSEGVs inside libGL. Chromium's GPU process needs exactly
-   this (compositor context + ANGLE context + WebGL context), so it is
-   the blocker for the canvas being sampled. Reproducer:
-   `~/kbase-test/glx_es_noshare.c` (crashes at the `glXMakeCurrent`
-   after the second `glXCreateContextAttribsARB`). Needs a `-g` build to
-   pinpoint the faulting function (the release build's unwind points at
-   `__glxGetMscRate`, i.e. the frame is bogus).
-2. **The default framebuffer has no read buffer.** `glReadPixels` on the
+1. **The default framebuffer has no read buffer.** `glReadPixels` on the
    default framebuffer fails with
    `glReadPixels(GL_IMPLEMENTATION_COLOR_READ_FORMAT: no GL_READ_BUFFER)`
    → INVALID_OPERATION. FBO rendering and FBO readback are fine
@@ -149,8 +140,27 @@ Environment (Dimensity 6300, Android 13, Termux unprivileged):
    the default (window/pbuffer) surface's framebuffer state is the odd
    one out. Mesa sets `_ColorReadBufferIndex` in
    `_mesa_initialize_window_framebuffer()` (BUFFER_BACK_LEFT for
-   double-buffered) and clears `_ColorReadBuffer` when the fb is
-   0×0 or the index is BUFFER_NONE.
+   double-buffered) and clears `_ColorReadBuffer` when the fb is 0×0 or
+   the index is BUFFER_NONE. Chromium's compositor needs exactly this
+   path to get the WebGL canvas onto the screen.
+2. **Cross-context textures are not usable.** Two GLX contexts on the
+   same screen (one created with the other as share context) work, and
+   both make current fine, but an FBO in context 2 that attaches a
+   texture created in context 1 is `GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT`
+   (0x8cd6) and every draw into it fails with
+   GL_INVALID_FRAMEBUFFER_OPERATION (0x506). Only one kbase device and
+   one screen exist for the two contexts, so this is the driver's
+   resource-sharing path, not screen creation. Chromium's compositor
+   samples the WebGL canvas (a shared image) from a different context,
+   so this is the most likely reason the canvas stays empty.
+   Reproducer: `~/kbase-test/glx_es_share.c`.
+
+   Trap when writing such probes: the exported `glXMakeCurrent` is the
+   **GLX 1.1 three-argument** form `glXMakeCurrent(dpy, draw, ctx)`;
+   passing four arguments makes the drawable XID land in the context
+   slot and you get a bogus "crash" in `MakeContextCurrent` (fault
+   address `xid+0x30`). Use `glXMakeContextCurrent` for the 4-argument
+   form.
 
 - ANGLE's context ladder (`GenerateContextCreationToTry`): desktop core
   4.5→3.2, desktop legacy 3.3, then ES 3.2→2.0. Its GL backend also
