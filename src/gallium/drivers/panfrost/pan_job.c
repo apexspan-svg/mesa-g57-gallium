@@ -763,36 +763,60 @@ out:
 
 /* Drop the GPU's cached copies of the textures we just rendered into.
  *
- * Mali keeps its own cached copies of texture data, keyed by the
- * descriptor.  When one context writes a texture, a *different* context
- * that samples the same texture keeps reading the stale cached copy,
- * because nothing tells the GPU that the memory changed.  The kbase
- * backend can do the required cache maintenance for an address range
- * (MEM_SYNC "clean to memory"), so ask it to after every submit that
- * wrote a texture.
+ * Mali keeps cached copies of texture data in the shader cores' L2.  When
+ * one context writes a texture, a *different* context that samples the
+ * same texture keeps reading the stale cached copy, because nothing tells
+ * the GPU that the memory changed (chromium's compositor samples the
+ * WebGL canvas from another context in ANGLE's share group, which is why
+ * the canvas stayed blank while the rest of the page was fine).
+ *
+ * A Cache Flush Job with the "Invalidate Shader Core LS" bit drops those
+ * copies.  The job payload is two bytes at offset 32 of the job
+ * descriptor: bit 0:1 invalidates the shader core L2 (which caches
+ * texture data) and bit 1:1 invalidates L2.
  */
 static void
 panfrost_clean_written_textures(struct panfrost_context *ctx)
 {
    struct panfrost_device *dev = pan_device(ctx->base.screen);
 
-   /* Only the kbase backend needs this: the DRI/drm path relies on the
+   /* Only the kbase backend needs this: the drm path relies on the
     * driver's own resource invalidation. */
    if (!pan_kbase_jm_is_kbase(dev))
       return;
 
+   bool painted = false;
    for (unsigned i = 0; i < ctx->pipe_framebuffer.nr_cbufs; ++i) {
       struct pipe_resource *tex = ctx->pipe_framebuffer.cbufs[i].texture;
       if (!tex)
          continue;
 
       struct panfrost_resource *prsrc = pan_resource(tex);
-      if (!prsrc->bo || !prsrc->bo->kmod_bo)
+      if (!prsrc->painted)
          continue;
 
-      pan_kmod_bo_clean_gpu_cache(prsrc->bo->kmod_bo,
-                                prsrc->bo->kmod_bo->size);
+      prsrc->painted = false;
+      painted = true;
    }
+
+   if (!painted)
+      return;
+
+   /* Cache Flush Job: the header is at offset 0, the payload at offset 32.
+    * "Invalidate Shader Core LS" drops the shader cores' L2, which is
+    * where Mali caches texture data. */
+   uint8_t job[64] __attribute__((aligned(64))) = {0};
+   pan_cast_and_pack(job, CACHE_FLUSH_JOB, cfg) {
+      cfg.header.type = MALI_JOB_TYPE_CACHE_FLUSH;
+      cfg.header.barrier = false;
+      cfg.header.suppress_prefetch = false;
+      cfg.header.index = 0;
+      cfg.header.dependency_1 = 0;
+      cfg.header.dependency_2 = 0;
+      cfg.payload.invalidate_shader_core_ls = true;
+   }
+
+   pan_kbase_jm_submit_jc(dev, (uint64_t)(uintptr_t)job, 0);
 }
 
 /* Submit all batches */

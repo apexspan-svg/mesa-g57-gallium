@@ -158,12 +158,28 @@ Environment (Dimensity 6300, Android 13, Termux unprivileged):
    ✓). But a texture created in context 1 is *visible* in context 2 (the
    texture object is shared: `glGetTexLevelParameteriv` reports the
    right size ✓) while its **contents are empty** — sampling it gives
-   0,0,0,0. So the *st* share group works but the pipe-level resource
-   is not shared. Chromium's compositor samples the WebGL canvas from
-   another context in ANGLE's share group, so this is the most likely
-   reason the canvas stays empty — note that chromium's *other* content
+   0,0,0,0. The resource is created *once* (the `PANDBG` BO-handle dump
+   shows a single allocation ✓) and the second context can even *write*
+   into it and read its own write back ✓ — so both contexts use the same
+   memory and the difference is visibility: Mali keeps cached copies of
+   texture data in the shader cores' L2, and nothing tells the GPU that
+   the memory changed. Chromium's compositor samples the WebGL canvas
+   from another context in ANGLE's share group, so this is the reason
+   the canvas stays empty — note that chromium's *other* content
    (toolbar, page text) does reach the screen, so the GPU→X present
    path itself is fine.
+
+   Fix: after a submit that wrote a render target, emit a Mali **Cache
+   Flush Job** with the "Invalidate Shader Core LS" bit (the fork's
+   genxml has the job type and payload ✓, `v6.xml`: "Cache Flush Job" ✓
+   with a Header section at 0 and a Payload at 32 ✓). Upstream panfrost
+   gets the same effect from the per-texture CRC in the sampled
+   descriptor — this fork has no `pan_texture.c`, so the CRC path does
+   not exist here.
+
+   Note: a kbase `MEM_SYNC` "clean to memory" over the BO's address
+   range is *not* enough — that cleans the data caches, not the
+   shader cores' texture cache.
    Reproducer: `~/kbase-test/glx_es_share.c` (c2 "own-fbo px=64,128,191,255"
    ✓ vs "centre px=0,0,0,0" for the foreign texture ✗).
    Where to look: the resource table the kbase backend uses for BOs

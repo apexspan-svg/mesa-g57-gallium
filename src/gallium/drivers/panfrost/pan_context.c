@@ -425,8 +425,12 @@ panfrost_set_framebuffer_state(struct pipe_context *pctx,
    ctx->fb_rt_mask = 0;
 
    for (unsigned i = 0; i < ctx->pipe_framebuffer.nr_cbufs; ++i) {
-      if (ctx->pipe_framebuffer.cbufs[i].texture)
+      if (ctx->pipe_framebuffer.cbufs[i].texture) {
          ctx->fb_rt_mask |= BITFIELD_BIT(i);
+         /* Remember that the GPU wrote to this texture: its cached copies
+          * have to be dropped before another context samples it. */
+         pan_resource(ctx->pipe_framebuffer.cbufs[i].texture)->painted = true;
+      }
    }
 }
 

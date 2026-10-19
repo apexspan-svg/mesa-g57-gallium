@@ -98,6 +98,11 @@ struct panfrost_resource {
    /* Whether the resource owns the backing BO's label */
    bool owns_label;
 
+   /* Set when this resource was used as a render target: the GPU keeps
+    * cached copies of it, and other contexts sampling it must be made to
+    * see the new contents. */
+   bool painted;
+
    /* CRC state */
    struct pan_crc_state crc_state;
 
