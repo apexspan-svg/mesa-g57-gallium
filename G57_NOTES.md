@@ -143,17 +143,22 @@ Environment (Dimensity 6300, Android 13, Termux unprivileged):
    double-buffered) and clears `_ColorReadBuffer` when the fb is 0×0 or
    the index is BUFFER_NONE. Chromium's compositor needs exactly this
    path to get the WebGL canvas onto the screen.
-2. **Cross-context textures are not usable.** Two GLX contexts on the
-   same screen (one created with the other as share context) work, and
-   both make current fine, but an FBO in context 2 that attaches a
-   texture created in context 1 is `GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT`
-   (0x8cd6) and every draw into it fails with
-   GL_INVALID_FRAMEBUFFER_OPERATION (0x506). Only one kbase device and
-   one screen exist for the two contexts, so this is the driver's
-   resource-sharing path, not screen creation. Chromium's compositor
-   samples the WebGL canvas (a shared image) from a different context,
-   so this is the most likely reason the canvas stays empty.
-   Reproducer: `~/kbase-test/glx_es_share.c`.
+2. **Cross-context texture *contents* are not shared.** Two GLX contexts on
+   the same screen (one created with the other as share context) both
+   work and both make current fine, and the shared context renders
+   correctly on its own (FBO clear + readback returns the exact colour
+   ✓). But a texture created in context 1 is *visible* in context 2 (the
+   texture object is shared: `glGetTexLevelParameteriv` reports the
+   right size ✓) while its **contents are empty** — sampling it gives
+   0,0,0,0. So the *st* share group works but the pipe-level resource
+   is not shared. Chromium's compositor samples the WebGL canvas from
+   another context in ANGLE's share group, so this is the most likely
+   reason the canvas stays empty.
+   Reproducer: `~/kbase-test/glx_es_share.c` (c2 "own-fbo px=64,128,191,255"
+   ✓ vs "centre px=0,0,0,0" for the foreign texture ✗).
+   Where to look: the resource table the kbase backend uses for BOs
+   (`pan_bo.c`, `pan_kbase_jm.c`) — if it is per-context rather than
+   per-screen, a foreign texture's storage is invisible.
 
    Trap when writing such probes: the exported `glXMakeCurrent` is the
    **GLX 1.1 three-argument** form `glXMakeCurrent(dpy, draw, ctx)`;
