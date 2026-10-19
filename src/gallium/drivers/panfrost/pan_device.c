@@ -7,6 +7,7 @@
 
 #include "drm-uapi/panfrost_drm.h"
 #include "util/hash_table.h"
+#include "util/log.h"
 #include "util/macros.h"
 #include "util/u_math.h"
 #include "util/u_thread.h"
@@ -68,6 +69,10 @@ panfrost_open_device(void *memctx, int fd, struct panfrost_device *dev)
       mesa_loge("panfrost: unrecognised GPU ID 0x%"PRIx64, dev->kmod.dev->props.gpu_id);
       goto err_free_kmod_dev;
    }
+   mesa_log(MESA_LOG_ERROR, "panfrost",
+            "panfrost: open_device fd=%d kmod=%p gpu_id=0x%x arch=%d\n",
+            fd, (void *)dev->kmod.dev,
+            (unsigned)dev->kmod.dev->props.gpu_id, dev->arch);
 
    /* 48bit address space max, with the lower 32MB reserved. We clamp
     * things so it matches kmod VA range limitations.

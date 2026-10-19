@@ -186,6 +186,13 @@ driCreateNewScreen3(int scrn, int fd,
     if (screen->max_gl_es2_version >= 30)
        screen->api_mask |= (1 << __DRI_API_GLES3);
 
+    /* gallium/kbase diagnostics: unconditionally log every successful
+     * screen creation so chromium GPU-process failures can be attributed
+     * to the last reached stage. */
+    mesa_log(MESA_LOG_ERROR, "gallium-dri",
+             "dri: CreateNewScreen3 OK type=%d pscreen=%p api_mask=0x%x\n",
+             (int)type, (void *)pscreen, screen->api_mask);
+
     return screen;
 }
 

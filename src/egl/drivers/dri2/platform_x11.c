@@ -1209,8 +1209,14 @@ dri2_initialize_x11_dri3(_EGLDisplay *disp)
 
    dri2_dpy->loader_extensions = dri3_image_loader_extensions;
 
+   mesa_log(MESA_LOG_ERROR, "mesa-egl",
+            "x11-dri3: entering dri2_initialize_x11_dri3\n");
+
    if (!platform_x11_finalize(disp, false))
       return EGL_FALSE;
+
+   mesa_log(MESA_LOG_ERROR, "mesa-egl",
+            "x11-dri3: platform_x11_finalize done\n");
 
    loader_init_screen_resources(&dri2_dpy->screen_resources, dri2_dpy->conn,
                                 dri2_dpy->screen);

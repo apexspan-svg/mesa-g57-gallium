@@ -40,6 +40,8 @@
 #include "pan_public.h"
 #include "pan_resource.h"
 #include "pan_screen.h"
+
+#include "util/log.h"
 #include "pan_compiler.h"
 #include "pan_util.h"
 #include "pan_trace.h"
@@ -1087,6 +1089,8 @@ panfrost_create_screen(int fd, const struct pipe_screen_config *config,
       ralloc_free(screen);
       return NULL;
    }
+   mesa_log(MESA_LOG_ERROR, "panfrost",
+            "panfrost: create_screen fd=%d open_device OK\n", fd);
 
    if (dev->debug & PAN_DBG_NO_AFBC)
       dev->has_afbc = false;
