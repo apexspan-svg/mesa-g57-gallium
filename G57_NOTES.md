@@ -91,25 +91,39 @@ Environment (Dimensity 6300, Android 13, Termux unprivileged):
 - ANGLE's FBConfig query (exact list in DisplayGLX.cpp) demands RGBA8 +
   depth 24 + stencil 8 + doublebuffer + WINDOW|PBUFFER|PIXMAP +
   X_RENDERABLE + **GLX_CONFIG_CAVEAT == GLX_NONE**.
-- The blocker is that one attribute, and it is *not* ours: the Termux:X11
-  server's GLX is a **software** implementation, so it rates all of its
-  configs `GLX_SLOW_CONFIG` (0x8000); `createDriMode()` copied that rating
-  verbatim into the client config list (`driConfig->base = *config;`),
-  even though the config is backed by one of our hardware DRI configs and
-  is rendered by us, on the GPU. Any client asking for `GLX_NONE` — ANGLE
-  does — got **zero** FBConfigs → "Could not find a decent GLX FBConfig to
-  create the context." → EGL_NOT_INITIALIZED. Fix (`987fd25`): upgrade
-  SLOW → NONE in `createDriMode()`; NON_CONFORMANT ratings are kept.
-- Dead end worth recording: changing the *driver's* caveat in
-  `dri_util.c` does **not** help — `driConfigEqual()` compares the
-  driver's caveat against the server's rating and drops the config on
-  mismatch, so it shrank the list (840 → 570 configs) without fixing the
-  query. The rating has to be fixed where the final config is built.
+- **Trap — the value of `GLX_NONE` in this environment.** xorgproto's
+  `glxtokens.h` defines the *caveat* namespace as `GLX_NONE 0x8000`,
+  `GLX_SLOW_CONFIG 0x8001`, `GLX_NON_CONFORMANT_CONFIG 0x800D` (the
+  GLX_EXT_visual_rating values), while the attribute-list terminator is
+  the X11 `None` (0). So "no caveat" is **0x8000**, not 0. A probe that
+  asks for caveat 0 gets *zero* configs and looks like a driver bug; the
+  same query with 0x8000 returns **28** configs. Our configs report
+  0x8000, i.e. "no caveat" ✓.
+- The remaining blocker is **ANGLE's context creation**, not the config
+  query: ANGLE's ladder is desktop core 4.5→3.2, desktop legacy 3.3,
+  then ES 3.2→2.0. Standalone on the device, that ladder ends at
+  **ES 3.1** ("OpenGL ES 3.1 Mesa 26.3.0-devel", renderer "Mali-G57 MC2
+  (Panfrost)") with pbuffer + makeCurrent ✓ — so our driver *can*
+  satisfy ANGLE; inside chromium's GPU process every attempt fails and
+  ANGLE reports "Could not create a backing OpenGL context".
+- Our GLX creates the context client-side and then asks the X server to
+  register it (`xcb_glx_create_context_attribs_arb_checked`); if the
+  server rejects that request the client destroys the context and
+  returns NULL. The Termux:X11 server's GLX is a software
+  implementation, so this hand-shake is a prime suspect (X error
+  `GLXBadFBConfig` = 165 is what the server replies).
 - Bisecting ANGLE's attribute list (`~/kbase-test/glx_attr_bisect.c`:
   full list, then the list minus one attribute at a time, then each
-  attribute alone) named the culprit in one run: "without
-  GLX_CONFIG_CAVEAT → n=20", "only GLX_CONFIG_CAVEAT → n=0". Reach for
-  that bisect whenever a GLX/EGL query returns nothing.
+  attribute alone) is the fastest way to name a failing GLX query
+  requirement — but check the constant values first (see the trap
+  above).
+- Repro without chromium: `~/kbase-test/glx_angle_probe.c` (ANGLE's
+  exact init: FBConfig query + the whole context ladder), `glx_ctx_matrix.c`
+  (context creation for every candidate config), `glx_cfg_dump.c`
+  (per-config attribute dump), `glx_es_probe.c`, `glx_cap_probe.c`.
+  Note: in the probe, declare `glXChooseFBConfig` as returning
+  `GLXFBConfig *` — an `int` return truncates the pointer and the
+  "crash" is your own bug, not the driver's.
 - ANGLE's context ladder (`GenerateContextCreationToTry`): desktop core
   4.5→3.2, desktop legacy 3.3, then ES 3.2→2.0. Its GL backend also
   refuses desktop GL < 3.2 ("Desktop GL below 3.2 is not supported"), and
