@@ -91,13 +91,25 @@ Environment (Dimensity 6300, Android 13, Termux unprivileged):
 - ANGLE's FBConfig query (exact list in DisplayGLX.cpp) demands RGBA8 +
   depth 24 + stencil 8 + doublebuffer + WINDOW|PBUFFER|PIXMAP +
   X_RENDERABLE + **GLX_CONFIG_CAVEAT == GLX_NONE**.
-- Our `dri_util.c` reported `__DRI_ATTRIB_SLOW_BIT` for every config that
-  carries an accumulation buffer; `fbconfigs_compatible()` maps that to
-  GLX_SLOW_CONFIG (0x8000), so ANGLE's `GLX_NONE` request rejected
-  *every* config → "Could not find a decent GLX FBConfig to create the
-  context." → EGL_NOT_INITIALIZED. Fix (`6b522f1`): report caveat 0 —
-  the kbase device is a hardware accelerator (upstream Mesa reports 0
-  here too).
+- The blocker is that one attribute, and it is *not* ours: the Termux:X11
+  server's GLX is a **software** implementation, so it rates all of its
+  configs `GLX_SLOW_CONFIG` (0x8000); `createDriMode()` copied that rating
+  verbatim into the client config list (`driConfig->base = *config;`),
+  even though the config is backed by one of our hardware DRI configs and
+  is rendered by us, on the GPU. Any client asking for `GLX_NONE` — ANGLE
+  does — got **zero** FBConfigs → "Could not find a decent GLX FBConfig to
+  create the context." → EGL_NOT_INITIALIZED. Fix (`987fd25`): upgrade
+  SLOW → NONE in `createDriMode()`; NON_CONFORMANT ratings are kept.
+- Dead end worth recording: changing the *driver's* caveat in
+  `dri_util.c` does **not** help — `driConfigEqual()` compares the
+  driver's caveat against the server's rating and drops the config on
+  mismatch, so it shrank the list (840 → 570 configs) without fixing the
+  query. The rating has to be fixed where the final config is built.
+- Bisecting ANGLE's attribute list (`~/kbase-test/glx_attr_bisect.c`:
+  full list, then the list minus one attribute at a time, then each
+  attribute alone) named the culprit in one run: "without
+  GLX_CONFIG_CAVEAT → n=20", "only GLX_CONFIG_CAVEAT → n=0". Reach for
+  that bisect whenever a GLX/EGL query returns nothing.
 - ANGLE's context ladder (`GenerateContextCreationToTry`): desktop core
   4.5→3.2, desktop legacy 3.3, then ES 3.2→2.0. Its GL backend also
   refuses desktop GL < 3.2 ("Desktop GL below 3.2 is not supported"), and
