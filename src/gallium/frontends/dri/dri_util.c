@@ -266,10 +266,14 @@ driGetConfigAttribIndex(const struct dri_config *config,
             *value |= __DRI_ATTRIB_FLOAT_BIT;
         break;
     case __DRI_ATTRIB_CONFIG_CAVEAT:
-        if (config->modes.accumRedBits != 0)
-            *value = __DRI_ATTRIB_SLOW_BIT;
-        else
-            *value = 0;
+        /* The gallium/kbase device is a hardware accelerator, so its configs
+         * carry no caveat.  Reporting GLX_SLOW_CONFIG (or
+         * GLX_NON_CONFORMANT_CONFIG) for every config made
+         * fbconfigs_compatible() reject all of them for clients that ask
+         * for GLX_CONFIG_CAVEAT == GLX_NONE -- which is exactly what ANGLE's
+         * native-GL (GLX) backend does, leaving it with zero FBConfigs and
+         * failing with "Could not create a backing OpenGL context". */
+        *value = 0;
         break;
     case __DRI_ATTRIB_CONFORMANT:
         *value = GL_TRUE;
