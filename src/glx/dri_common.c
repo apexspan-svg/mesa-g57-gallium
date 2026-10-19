@@ -908,8 +908,16 @@ dri_create_context_attribs(struct glx_screen *base,
 
    *error = dri_context_error_to_glx_error(*error);
 
-   if (pcp->driContext == NULL)
+   if (pcp->driContext == NULL) {
+      /* Diagnostics: ANGLE's native-GL backend reports only "Could not
+       * create a backing OpenGL context"; print what failed here. */
+      fprintf(stderr,
+              "GLXDBG: client-side context creation FAILED (api=%d dri_error=%u "
+              "glx_error=%u driConfig=%p num_attribs=%u)\n",
+              dca.api, (unsigned)*error, (unsigned)*error,
+              (void *)(config ? config->driConfig : NULL), num_ctx_attribs / 2);
       goto error_exit;
+   }
 
    pcp->vtable = base->context_vtable;
 

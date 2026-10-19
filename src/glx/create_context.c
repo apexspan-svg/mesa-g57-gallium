@@ -130,6 +130,14 @@ glXCreateContextAttribsARB(Display *dpy, GLXFBConfig config,
       gc = psc->vtable->create_context_attribs(psc, cfg, share, num_attribs,
                       (const uint32_t *) attrib_list,
                       &error);
+      if (!gc) {
+         fprintf(stderr, "GLXDBG: create_context_attribs FAILED (error=%u attribs=[",
+                 error);
+         for (unsigned i = 0; i < num_attribs; i++)
+            fprintf(stderr, "%d,", attrib_list[i * 2 + 1]);
+         fprintf(stderr, "] fbconfigID=%d visualID=%d)\n",
+                 cfg ? cfg->fbconfigID : -1, cfg ? cfg->visualID : -1);
+      }
    } else if (!direct) {
 #if defined(GLX_INDIRECT_RENDERING)
       gc = indirect_create_context_attribs(psc, cfg, share, num_attribs,
@@ -180,6 +188,11 @@ glXCreateContextAttribsARB(Display *dpy, GLXFBConfig config,
                                                  attrib_list);
    err = xcb_request_check(c, cookie);
    if (err != NULL) {
+      fprintf(stderr,
+              "GLXDBG: server rejected GLXCreateContextAttribsARB (xcb error=%d "
+              "major=%d minor=%d fbconfigID=%d)\n",
+              err->error_code, err->major_code, err->minor_code,
+              cfg ? cfg->fbconfigID : -1);
       if (gc)
          gc->vtable->destroy(gc);
       gc = NULL;

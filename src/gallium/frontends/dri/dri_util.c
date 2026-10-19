@@ -621,12 +621,21 @@ driCreateContextAttribs(struct dri_screen *screen, int api,
     *error = validate_context_version(screen, mesa_api,
                                       ctx_config.major_version,
                                       ctx_config.minor_version);
-    if (*error != __DRI_CTX_ERROR_SUCCESS)
+    if (*error != __DRI_CTX_ERROR_SUCCESS) {
+       fprintf(stderr,
+               "GLXDBG: driCreateContextAttribs: version %d.%d rejected for api=%d "
+               "(error=%u)\n",
+               ctx_config.major_version, ctx_config.minor_version, api, *error);
        return NULL;
+    }
 
     struct dri_context *ctx = dri_create_context(screen, mesa_api,
                                                  modes, &ctx_config, error,
                                                  shared, data, thread_safe);
+    if (!ctx)
+       fprintf(stderr,
+               "GLXDBG: dri_create_context FAILED (api=%d version %d.%d error=%u)\n",
+               api, ctx_config.major_version, ctx_config.minor_version, *error);
     return ctx;
 }
 
