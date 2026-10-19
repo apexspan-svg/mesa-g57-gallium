@@ -132,17 +132,25 @@ Environment (Dimensity 6300, Android 13, Termux unprivileged):
   the "crash" is your own bug, not the driver's.
 
 ## Open gaps (driver bugs found 2026-10-19)
+0. **The exportable path cannot work in Termux.** `libnativewindow.so`
+   cannot be dlopen'ed (`libbinder_ndk.so` is missing), and
+   `AHardwareBuffer_allocate` from the system `libandroid.so` **aborts**
+   the process ("gralloc-mapper is missing") — the gralloc mapper HAL is
+   not reachable from an unprivileged app. So the kbase exportable BO
+   always fails ("panfrost/kbase: exportable alloc failed, using native
+   BO") and the DRI3 *image* path has no fd to hand the X server. The
+   present path survives this (the driver's own fallback ✓), but any
+   consumer that needs a *readback* or a *shared image* of a window
+   surface is out of luck.
 1. **The default framebuffer has no read buffer.** `glReadPixels` on the
    default framebuffer fails with
    `glReadPixels(GL_IMPLEMENTATION_COLOR_READ_FORMAT: no GL_READ_BUFFER)`
-   → INVALID_OPERATION. FBO rendering and FBO readback are fine
-   (`glx_es_draw.c`: FBO draw + readback returns the cleared pixel), so
-   the default (window/pbuffer) surface's framebuffer state is the odd
-   one out. Mesa sets `_ColorReadBufferIndex` in
-   `_mesa_initialize_window_framebuffer()` (BUFFER_BACK_LEFT for
-   double-buffered) and clears `_ColorReadBuffer` when the fb is 0×0 or
-   the index is BUFFER_NONE. Chromium's compositor needs exactly this
-   path to get the WebGL canvas onto the screen.
+   → INVALID_OPERATION — for a real *window* drawable as well as a
+   pbuffer (`glx_es_window.c`). FBO rendering and FBO readback are fine
+   (`glx_es_draw.c`: FBO draw + readback returns the cleared pixel), and
+   `GL_READ_BUFFER` is correctly `GL_BACK` — the window framebuffer
+   simply has no back-buffer renderbuffer attached, because the DRI3
+   image creation failed (see gap 0).
 2. **Cross-context texture *contents* are not shared.** Two GLX contexts on
    the same screen (one created with the other as share context) both
    work and both make current fine, and the shared context renders
@@ -153,7 +161,9 @@ Environment (Dimensity 6300, Android 13, Termux unprivileged):
    0,0,0,0. So the *st* share group works but the pipe-level resource
    is not shared. Chromium's compositor samples the WebGL canvas from
    another context in ANGLE's share group, so this is the most likely
-   reason the canvas stays empty.
+   reason the canvas stays empty — note that chromium's *other* content
+   (toolbar, page text) does reach the screen, so the GPU→X present
+   path itself is fine.
    Reproducer: `~/kbase-test/glx_es_share.c` (c2 "own-fbo px=64,128,191,255"
    ✓ vs "centre px=0,0,0,0" for the foreign texture ✗).
    Where to look: the resource table the kbase backend uses for BOs
