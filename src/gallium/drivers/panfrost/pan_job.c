@@ -761,6 +761,39 @@ out:
    panfrost_batch_cleanup(ctx, batch);
 }
 
+/* Drop the GPU's cached copies of the textures we just rendered into.
+ *
+ * Mali keeps its own cached copies of texture data, keyed by the
+ * descriptor.  When one context writes a texture, a *different* context
+ * that samples the same texture keeps reading the stale cached copy,
+ * because nothing tells the GPU that the memory changed.  The kbase
+ * backend can do the required cache maintenance for an address range
+ * (MEM_SYNC "clean to memory"), so ask it to after every submit that
+ * wrote a texture.
+ */
+static void
+panfrost_clean_written_textures(struct panfrost_context *ctx)
+{
+   struct panfrost_device *dev = pan_device(ctx->base.screen);
+
+   /* Only the kbase backend needs this: the DRI/drm path relies on the
+    * driver's own resource invalidation. */
+   if (!pan_kbase_jm_is_kbase(dev))
+      return;
+
+   for (unsigned i = 0; i < ctx->pipe_framebuffer.nr_cbufs; ++i) {
+      struct pipe_resource *tex = ctx->pipe_framebuffer.cbufs[i].texture;
+      if (!tex)
+         continue;
+
+      struct panfrost_resource *prsrc = pan_resource(tex);
+      if (!prsrc->bo || !prsrc->bo->kmod_bo)
+         continue;
+
+      pan_kmod_bo_clean_gpu_cache(prsrc->bo->kmod_bo, prsrc->base.size);
+   }
+}
+
 /* Submit all batches */
 
 void
@@ -780,6 +813,10 @@ panfrost_flush_all_batches(struct panfrost_context *ctx, const char *reason)
       if (ctx->batches.slots[i].seqnum)
          panfrost_batch_submit(ctx, &ctx->batches.slots[i]);
    }
+
+   /* The submits above wrote the render targets; make sure the GPU drops
+    * its cached copies of them so that other contexts observe the writes. */
+   panfrost_clean_written_textures(ctx);
 
    if (pan_device(ctx->base.screen)->arch >= 10)
       u_trace_context_process(&ctx->trace_context, false);

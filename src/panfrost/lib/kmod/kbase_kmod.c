@@ -2333,6 +2333,41 @@ kbase_kmod_bo_wait(struct pan_kmod_bo *bo, int64_t timeout_ns,
    return true;
 }
 
+/* Drop the GPU's cached copies of a buffer object.
+ *
+ * Mali keeps its own cached copies of texture data.  When one GL context
+ * renders into a texture, another context that samples the same texture
+ * keeps seeing the stale cached copy, because nothing tells the GPU that
+ * the memory changed.  kbase's MEM_SYNC ioctl with BASE_SYNCSET_OP_MSYNC
+ * ("clean to memory") performs the required cache maintenance for the
+ * given address range.
+ */
+static int
+kbase_kmod_bo_clean_gpu_cache(struct pan_kmod_bo *bo, uint64_t size)
+{
+   struct kbase_kmod_bo *kbase_bo =
+      container_of(bo, struct kbase_kmod_bo, base);
+
+   if (!size)
+      return 0;
+
+   struct kbase_ioctl_mem_sync req = {
+      .handle = kbase_bo->gpu_va,
+      .user_addr = (uintptr_t)kbase_bo->cpu_ptr,
+      .size = size,
+      .type = BASE_SYNCSET_OP_MSYNC,
+   };
+
+   if (pan_kmod_ioctl(bo->dev->fd, KBASE_IOCTL_MEM_SYNC, &req)) {
+      /* Not fatal: the kernel may not implement cache maintenance for this
+       * range.  Keep it quiet so a per-frame clean cannot spam the log. */
+      mesa_logd("kbase: KBASE_IOCTL_MEM_SYNC(clean) failed: %s", strerror(errno));
+      return -1;
+   }
+
+   return 0;
+}
+
 static int
 kbase_kmod_flush_bo_map_syncs(struct pan_kmod_dev *dev)
 {
@@ -2503,6 +2538,7 @@ const struct pan_kmod_ops kbase_kmod_ops = {
    .bo_mmap                = kbase_kmod_bo_mmap,
    .bo_munmap              = kbase_kmod_bo_munmap,
    .flush_bo_map_syncs     = kbase_kmod_flush_bo_map_syncs,
+   .bo_clean_gpu_cache    = kbase_kmod_bo_clean_gpu_cache,
    .bo_wait                = kbase_kmod_bo_wait,
    .bo_make_evictable      = kbase_kmod_bo_make_evictable,
    .bo_make_unevictable    = kbase_kmod_bo_make_unevictable,

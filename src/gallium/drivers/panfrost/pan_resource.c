@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <xf86drm.h>
 #include "drm-uapi/drm_fourcc.h"
 
@@ -1073,10 +1074,11 @@ panfrost_resource_create_with_modifier(struct pipe_screen *screen,
 
    panfrost_resource_setup(screen, so, modifier, template->format, plane_idx);
 
-   /* TEMPORARY diagnostic: identify the backing BO of every resource so a
+   /* Diagnostic: identify the backing BO of every resource so a
     * cross-context sharing bug (a texture created in one GL context being
-    * invisible in another) can be told apart from a cache-coherency bug. */
-   {
+    * invisible in another) can be told apart from a cache-coherency bug.
+    * Enabled with PAN_KBASE_DEBUG_RES=1. */
+   if (getenv("PAN_KBASE_DEBUG_RES")) {
       uint32_t handle = 0;
       if (so->bo && so->bo->kmod_bo)
          handle = so->bo->kmod_bo->handle;

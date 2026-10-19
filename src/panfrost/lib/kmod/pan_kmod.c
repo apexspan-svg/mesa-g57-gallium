@@ -305,6 +305,17 @@ pan_kmod_flush_bo_map_syncs(struct pan_kmod_dev *dev)
  */
 #define MAX_PENDING_SYNC_OPS 4096
 
+int
+pan_kmod_bo_clean_gpu_cache(struct pan_kmod_bo *bo, uint64_t size)
+{
+   struct pan_kmod_dev *dev = bo->dev;
+
+   if (!dev->ops->bo_clean_gpu_cache)
+      return 0;
+
+   return dev->ops->bo_clean_gpu_cache(bo, size);
+}
+
 void
 pan_kmod_queue_bo_map_sync(struct pan_kmod_bo *bo, uint64_t bo_offset,
                            void *cpu_ptr, uint64_t range,

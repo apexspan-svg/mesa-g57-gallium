@@ -536,6 +536,14 @@ struct pan_kmod_ops {
    /* Flush the pending BO map syncs. */
    int (*flush_bo_map_syncs)(struct pan_kmod_dev *dev);
 
+   /* Clean the GPU caches for a buffer object's address range.  The GPU
+    * keeps its own cached copies of texture data; when one context writes a
+    * texture, another context that samples it would otherwise keep seeing
+    * the stale cached copy.  This is optional: backends that have no
+    * equivalent leave it NULL.
+    */
+   int (*bo_clean_gpu_cache)(struct pan_kmod_bo *bo, uint64_t size);
+
    /* Wait for a buffer object to be ready for read or read/write accesses. */
    bool (*bo_wait)(struct pan_kmod_bo *bo, int64_t timeout_ns,
                    bool for_read_only_access);
@@ -857,6 +865,10 @@ pan_kmod_can_sync_bo_map_from_userland(struct pan_kmod_dev *dev)
 void pan_kmod_queue_bo_map_sync(struct pan_kmod_bo *bo, uint64_t bo_offset,
                                 void *cpu_ptr, uint64_t range,
                                 enum pan_kmod_bo_sync_type type);
+
+/* Drop the GPU's cached copies of a buffer object so that other contexts
+ * sampling it observe writes made by this one.  Returns 0 on success. */
+int pan_kmod_bo_clean_gpu_cache(struct pan_kmod_bo *bo, uint64_t size);
 
 void pan_kmod_flush_bo_map_syncs(struct pan_kmod_dev *dev);
 
